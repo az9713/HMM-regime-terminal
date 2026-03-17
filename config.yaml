@@ -1,0 +1,64 @@
+# HMM Regime Terminal — Configuration
+# All tunable parameters in one place
+
+data:
+  default_ticker: "BTC-USD"
+  default_interval: "1h"       # 1m, 5m, 15m, 1h, 1d
+  default_lookback_days: 90
+  features:
+    - log_return
+    - rolling_vol
+    - volume_change
+    - intraday_range
+    - rsi
+  rolling_vol_window: 21
+  rsi_period: 14
+
+hmm:
+  min_states: 2
+  max_states: 8
+  n_restarts: 20
+  n_iter: 200
+  tol: 1.0e-4
+  model_type: "gaussian"       # gaussian or gmm
+  covariance_type: "full"      # full, diag, tied, spherical
+  gmm_n_mix: 2                 # mixtures per state (GMM only)
+
+strategy:
+  confirmations:
+    rsi_oversold: 30
+    rsi_overbought: 70
+    momentum_window: 10
+    vol_low_pct: 20
+    vol_high_pct: 80
+    volume_threshold: 1.2      # ratio vs 20-bar average
+    adx_threshold: 20
+    ema_period: 50
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    min_confidence: 0.6        # entropy-based regime confidence
+  min_confirmations: 4         # out of 8 conditions
+  cooldown_bars: 5
+  min_hold_bars: 10
+  hysteresis_bars: 3           # regime must persist this long
+
+risk:
+  use_kelly: true
+  kelly_fraction: 0.5          # half-Kelly
+  use_entropy_scaling: true
+  max_leverage: 2.0
+  max_position_pct: 1.0        # cap at 100% of equity
+  stop_loss_pct: 0.05
+  take_profit_pct: 0.15
+
+backtest:
+  train_window_bars: 500
+  test_window_bars: 100
+  step_bars: 50                # advance step
+  initial_capital: 100000
+  commission_pct: 0.001        # 10 bps
+  slippage_pct: 0.0005         # 5 bps
+  bootstrap_samples: 1000
+  bootstrap_ci: 0.90
+  benchmark_ticker: null       # null = buy-and-hold same asset
