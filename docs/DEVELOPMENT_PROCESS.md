@@ -138,6 +138,57 @@ For a complete guide to git worktrees in Claude Code, see
 
 ---
 
+## Cross-Feature Awareness Gap (Lesson Learned)
+
+### The Problem
+
+After merging all three worktrees, a gap was discovered: the landing page
+(from Worktree 1) had **no mention of the Fundamentals feature** (from
+Worktree 2). Specifically:
+
+- The pipeline visualization showed 5 steps instead of 6
+- The concept cards section had 5 cards instead of 6
+- The hero subtitle didn't mention fundamental analysis
+
+This happened because each worktree agent started from the same `main` HEAD
+and had zero knowledge of what the other agents were building. Worktree 1
+designed a landing page for a 5-tab app — because that's all that existed
+when it started. Worktree 2 added Tab 6, but Worktree 1 never knew.
+
+### The Fix
+
+A post-merge integration commit added:
+- Step 06 "Fundamentals — Ratios, health score" to the pipeline
+- A "Fundamental Analysis" concept card with P/E, ROE, D/E, Health Score
+- "and fundamental financial analysis" to the hero subtitle
+
+See commit `8a7849b` — "Fix landing page gap: add Fundamental Analysis to
+pipeline and concept cards."
+
+### How to Prevent This in Future Projects
+
+The recommended approach is **brief each agent on what the others are building**
+when writing the worktree prompts:
+
+```
+"Start 3 worktrees:
+1. Redesign the landing page. NOTE: the app will have 6 tabs
+   including a new Fundamentals tab being built by another agent.
+   Include it in your pipeline and concept cards.
+2. Add fundamental analysis module and Tab 6.
+3. Rewrite docs. NOTE: include the Fundamentals tab in all sections."
+```
+
+This costs nothing (a few extra lines in the prompt) and prevents most
+cross-feature gaps. Follow up with a post-merge integration check to catch
+anything that slipped through.
+
+For a detailed analysis of this problem with four mitigation strategies,
+see the "Cross-Feature Awareness Problem" section in
+[WORKTREES.md](WORKTREES.md).
+
+---
+
 ## Related Documentation
 
 - [WORKTREES.md](WORKTREES.md) — Complete guide to git worktrees in Claude Code:

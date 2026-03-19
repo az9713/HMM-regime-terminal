@@ -451,7 +451,66 @@ This keeps your `main` branch clean while Claude experiments.
 | **Dependency management** | Each worktree may need its own venv, or you need to carefully share one. New dependencies added in one worktree won't be available in others. |
 | **Cleanup overhead** | After merging, you need to manually remove worktrees and branches. Not automatic. |
 | **Harder to coordinate** | If you realize mid-way that Agent A should import a module Agent B is creating, there's no way to communicate between running agents. Plan the division of labor carefully upfront. |
+| **Cross-feature blindness** | Each agent has zero knowledge of what others are building. If Agent A creates a UI that should reference Agent B's new feature, it won't — because it doesn't know the feature exists. Requires a post-merge integration pass. See [The Cross-Feature Awareness Problem](#the-cross-feature-awareness-problem). |
 | **Merge order matters** | With 3 worktrees touching overlapping files, the order you merge affects which conflicts arise. Plan the merge sequence. |
+
+### The Cross-Feature Awareness Problem
+
+This is the most important limitation to understand. It was discovered during this project's development and is documented here as a lesson learned.
+
+**What happened:** Three worktrees were launched in parallel:
+- Worktree 1: Redesign the landing page (pipeline visualization, concept cards)
+- Worktree 2: Add a Fundamentals tab with financial analysis
+- Worktree 3: Rewrite all documentation
+
+After merging all three, the landing page (from Worktree 1) had **no mention of the Fundamentals feature** (from Worktree 2). The pipeline showed only 5 steps instead of 6. The concept cards had 5 cards instead of 6. The hero subtitle didn't mention fundamental analysis.
+
+**Why it happened:** Each agent starts from the same `main` HEAD and has zero knowledge of what the other agents are building. Worktree 1 designed a landing page for a 5-tab app because that's what existed when it started. Worktree 2 added Tab 6, but Worktree 1 never knew about it.
+
+**The fix required a post-merge integration commit** to add the missing pipeline step, concept card, and subtitle text.
+
+#### How to Prevent This
+
+**Strategy 1: Shared spec in the prompt (recommended)**
+
+When launching worktrees, tell each agent about the others' work:
+
+```
+"Start 3 worktrees:
+1. Redesign the landing page. NOTE: the app will have 6 tabs
+   including a new Fundamentals tab (financial ratios, health score,
+   analyst data) being built by another agent. Include it in the
+   pipeline and concept cards.
+2. Add fundamental analysis module and Fundamentals tab.
+3. Rewrite documentation. NOTE: include the new Fundamentals tab
+   in all relevant sections."
+```
+
+The agents still can't see each other's code, but they can design for features they know are coming. This prevents most gaps at zero cost.
+
+**Strategy 2: Post-merge integration pass**
+
+Accept that gaps will happen and plan for a review after merging:
+
+```
+"Review app.py for consistency — make sure the landing page,
+tabs, and docs all reflect every feature that was merged."
+```
+
+**Strategy 3: Split by layer, not feature**
+
+Instead of one agent per feature, split by concern:
+- Agent 1: All backend modules (new .py files, data logic)
+- Agent 2: All frontend/UI (app.py — all tabs, landing page, CSS)
+- Agent 3: All documentation
+
+This way the UI agent owns the full interface and won't miss a tab. The tradeoff is that the UI agent needs to wait for the backend agent's API to be defined (or receive a spec).
+
+**Strategy 4: Sequential for coupled features**
+
+If feature B should be reflected in feature A's UI, don't parallelize them. Run B first, merge it, then run A so it sees B's work. Reserve parallelism for truly independent work.
+
+**Best practice: Strategy 1 + Strategy 2.** Brief each agent on what the others are building (prevents most gaps), then do a quick integration check after merge (catches the rest).
 
 ### When to Use Worktrees
 
