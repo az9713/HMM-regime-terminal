@@ -1094,7 +1094,8 @@ else:
         </div>
         <div class="hero-subtitle">
             Decode hidden market states with Bayesian model selection,
-            walk-forward backtesting, and entropy-weighted position sizing.
+            walk-forward backtesting, entropy-weighted position sizing,
+            and fundamental financial analysis.
         </div>
         <div class="hero-divider"></div>
     </div>
@@ -1142,6 +1143,14 @@ else:
                     <div class="step-num">05</div>
                     <div class="step-name">Generate Signals</div>
                     <div class="step-detail">Confirmed entries</div>
+                </div>
+                <span class="pipe-arrow">&rarr;</span>
+            </div>
+            <div class="pipe-step">
+                <div class="pipe-node">
+                    <div class="step-num">06</div>
+                    <div class="step-name">Fundamentals</div>
+                    <div class="step-detail">Ratios, health score</div>
                 </div>
             </div>
         </div>
@@ -1197,6 +1206,15 @@ else:
             <div class="concept-desc">
                 Anchored expanding-window backtest. Prevents look-ahead
                 bias by re-fitting the model at each fold boundary.
+            </div>
+        </div>
+        <div class="concept-card card-green">
+            <span class="concept-icon">&#x0024;</span>
+            <div class="concept-title">Fundamental Analysis</div>
+            <div class="concept-formula">P/E, ROE, D/E, Health Score</div>
+            <div class="concept-desc">
+                Financial ratios, income trends, balance sheet composition,
+                analyst consensus, and a composite health score for equities.
             </div>
         </div>
     </div>
