@@ -63,6 +63,12 @@ multi_timeframe:
     1d: 1.0
     1wk: 1.2
 
+monte_carlo:
+  n_paths: 1000                    # simulated market paths
+  n_steps: 252                     # bars per path (252 ≈ 1 trading year daily)
+  ruin_threshold: 0.5              # equity fraction defining ruin (50% loss)
+  seed: 42                         # reproducibility
+
 backtest:
   train_window_bars: 500
   test_window_bars: 100

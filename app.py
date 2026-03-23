@@ -20,6 +20,7 @@ from backtester import WalkForwardBacktester
 from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
+from monte_carlo import MonteCarloEngine
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -532,10 +533,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe",
+        "Multi-Timeframe", "Monte Carlo",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1439,6 +1440,286 @@ if run_btn:
                         "Weight": f"{DEFAULT_WEIGHTS.get(iv, 0.5):.1f}",
                     })
                 st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+
+    # ── Tab 9: Monte Carlo Simulation ──────────────────────────────────
+
+    with tab9:
+        st.subheader("Monte Carlo Regime Simulation")
+        st.caption(
+            "Leverages the HMM's generative model to simulate thousands of "
+            "synthetic market paths. Produces forward-looking risk metrics "
+            "that historical backtests cannot provide."
+        )
+
+        mc_col1, mc_col2, mc_col3 = st.columns(3)
+        with mc_col1:
+            mc_n_paths = st.number_input("Simulation Paths", 100, 10000, 1000, step=100, key="mc_paths")
+        with mc_col2:
+            mc_n_steps = st.number_input("Steps per Path", 50, 1000, 252, step=50, key="mc_steps")
+        with mc_col3:
+            mc_ruin = st.slider("Ruin Threshold", 0.1, 0.9, 0.5, 0.05, key="mc_ruin",
+                                help="Fraction of capital remaining that defines 'ruin'")
+
+        mc_run = st.button("Run Monte Carlo Simulation", type="primary", key="mc_run")
+
+        if mc_run:
+            with st.spinner(f"Simulating {mc_n_paths} paths x {mc_n_steps} steps..."):
+                mc_config = config.copy()
+                mc_config["monte_carlo"] = {
+                    "n_paths": mc_n_paths,
+                    "n_steps": mc_n_steps,
+                    "ruin_threshold": mc_ruin,
+                    "seed": 42,
+                }
+                mc_engine = MonteCarloEngine(mc_config)
+
+                mc_result = mc_engine.run(
+                    transmat=transmat,
+                    means=detector.model.means_,
+                    covars=detector.model.covars_,
+                    labels=labels,
+                    covariance_type=detector.covariance_type,
+                    n_paths=mc_n_paths,
+                    n_steps=mc_n_steps,
+                )
+
+            # ── Risk Metrics Cards ──
+            st.markdown("---")
+            st.subheader("Forward-Looking Risk Metrics")
+
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("VaR (95%)", f"{mc_result.var_95:+.2%}",
+                          help="5th percentile of terminal returns")
+            with m2:
+                st.metric("CVaR (95%)", f"{mc_result.cvar_95:+.2%}",
+                          help="Expected loss beyond VaR (tail risk)")
+            with m3:
+                st.metric("Ruin Probability", f"{mc_result.ruin_probability:.2%}",
+                          help=f"P(equity < {mc_ruin:.0%} of initial)")
+            with m4:
+                st.metric("Median Return", f"{mc_result.median_return:+.2%}")
+
+            m5, m6, m7, m8 = st.columns(4)
+            with m5:
+                st.metric("VaR (99%)", f"{mc_result.var_99:+.2%}")
+            with m6:
+                st.metric("CVaR (99%)", f"{mc_result.cvar_99:+.2%}")
+            with m7:
+                st.metric("Mean Return", f"{mc_result.mean_return:+.2%}")
+            with m8:
+                median_sharpe = float(np.median(mc_result.path_sharpes))
+                st.metric("Median Sharpe", f"{median_sharpe:.2f}")
+
+            # ── Equity Fan Chart ──
+            st.markdown("---")
+            st.subheader("Equity Fan Chart")
+            st.caption("Percentile bands across all simulated paths")
+
+            bands = mc_result.percentile_bands
+            x_axis = list(range(mc_n_steps))
+
+            fig_fan = go.Figure()
+
+            # 5th-95th band
+            fig_fan.add_trace(go.Scatter(
+                x=x_axis + x_axis[::-1],
+                y=list(bands[95]) + list(bands[5])[::-1],
+                fill="toself", fillcolor="rgba(0, 229, 153, 0.08)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name="5th-95th percentile", showlegend=True,
+            ))
+            # 25th-75th band
+            fig_fan.add_trace(go.Scatter(
+                x=x_axis + x_axis[::-1],
+                y=list(bands[75]) + list(bands[25])[::-1],
+                fill="toself", fillcolor="rgba(0, 229, 153, 0.18)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name="25th-75th percentile", showlegend=True,
+            ))
+            # Median
+            fig_fan.add_trace(go.Scatter(
+                x=x_axis, y=list(bands[50]),
+                mode="lines", name="Median",
+                line=dict(color="#00e599", width=2.5),
+            ))
+            # Initial capital reference
+            fig_fan.add_hline(
+                y=mc_engine.initial_capital, line_dash="dot",
+                line_color="#64748b", annotation_text="Initial Capital",
+            )
+
+            fig_fan.update_layout(
+                template="plotly_dark",
+                height=450,
+                xaxis_title="Simulation Step",
+                yaxis_title="Equity ($)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_fan, use_container_width=True)
+
+            # ── Terminal Wealth Distribution ──
+            st.subheader("Terminal Wealth Distribution")
+            tw_col1, tw_col2 = st.columns([2, 1])
+
+            with tw_col1:
+                terminal_returns = mc_result.terminal_wealth / mc_engine.initial_capital - 1
+                fig_tw = go.Figure()
+                fig_tw.add_trace(go.Histogram(
+                    x=terminal_returns * 100,
+                    nbinsx=60,
+                    marker_color="#00e599",
+                    opacity=0.7,
+                    name="Terminal Return %",
+                ))
+                fig_tw.add_vline(x=0, line_dash="solid", line_color="#ef4444", line_width=2,
+                                 annotation_text="Break-even")
+                fig_tw.add_vline(x=mc_result.var_95 * 100, line_dash="dash",
+                                 line_color="#f59e0b", line_width=1.5,
+                                 annotation_text="VaR 95%")
+                fig_tw.update_layout(
+                    template="plotly_dark", height=350,
+                    xaxis_title="Terminal Return (%)",
+                    yaxis_title="Frequency",
+                )
+                st.plotly_chart(fig_tw, use_container_width=True)
+
+            with tw_col2:
+                st.markdown("**Distribution Stats**")
+                pct_profitable = float((terminal_returns > 0).mean()) * 100
+                st.markdown(f"- Profitable paths: **{pct_profitable:.1f}%**")
+                st.markdown(f"- Mean return: **{mc_result.mean_return:+.2%}**")
+                st.markdown(f"- Median return: **{mc_result.median_return:+.2%}**")
+                st.markdown(f"- Std dev: **{terminal_returns.std():.2%}**")
+                st.markdown(f"- Skewness: **{float(pd.Series(terminal_returns).skew()):.2f}**")
+                st.markdown(f"- Kurtosis: **{float(pd.Series(terminal_returns).kurtosis()):.2f}**")
+                st.markdown(f"- Best path: **{terminal_returns.max():+.2%}**")
+                st.markdown(f"- Worst path: **{terminal_returns.min():+.2%}**")
+
+            # ── Max Drawdown Distribution ──
+            st.subheader("Max Drawdown Distribution")
+            dd_col1, dd_col2 = st.columns([2, 1])
+
+            with dd_col1:
+                fig_dd = go.Figure()
+                fig_dd.add_trace(go.Histogram(
+                    x=mc_result.max_drawdowns * 100,
+                    nbinsx=50,
+                    marker_color="#ef4444",
+                    opacity=0.7,
+                    name="Max Drawdown %",
+                ))
+                fig_dd.update_layout(
+                    template="plotly_dark", height=300,
+                    xaxis_title="Max Drawdown (%)",
+                    yaxis_title="Frequency",
+                )
+                st.plotly_chart(fig_dd, use_container_width=True)
+
+            with dd_col2:
+                st.markdown("**Drawdown Stats**")
+                st.markdown(f"- Median MDD: **{np.median(mc_result.max_drawdowns):.2%}**")
+                st.markdown(f"- Mean MDD: **{np.mean(mc_result.max_drawdowns):.2%}**")
+                st.markdown(f"- Worst MDD: **{mc_result.max_drawdowns.min():.2%}**")
+                st.markdown(f"- 95th pct MDD: **{np.percentile(mc_result.max_drawdowns, 5):.2%}**")
+
+            # ── Regime Time Allocation ──
+            st.subheader("Expected Regime Time Allocation")
+            regime_frac_df = pd.DataFrame([
+                {"Regime": label, "Time Fraction": frac}
+                for label, frac in mc_result.regime_time_fractions.items()
+            ]).sort_values("Time Fraction", ascending=False)
+
+            fig_regime = go.Figure(go.Bar(
+                x=regime_frac_df["Regime"],
+                y=regime_frac_df["Time Fraction"] * 100,
+                marker_color=["#ef4444" if "crash" in r or "bear" in r
+                              else "#00e599" if "bull" in r
+                              else "#f59e0b"
+                              for r in regime_frac_df["Regime"]],
+            ))
+            fig_regime.update_layout(
+                template="plotly_dark", height=300,
+                yaxis_title="Time in Regime (%)",
+                xaxis_title="Regime",
+            )
+            st.plotly_chart(fig_regime, use_container_width=True)
+
+            # ── Stress Scenarios ──
+            st.markdown("---")
+            st.subheader("Stress Test Scenarios")
+            st.caption(
+                "Fixed regime sequences with stochastic returns sampled from "
+                "the HMM emissions. Shows strategy resilience under adversarial conditions."
+            )
+
+            with st.spinner("Running stress scenarios..."):
+                stress_results = mc_engine.run_all_stress_tests(
+                    means=detector.model.means_,
+                    covars=detector.model.covars_,
+                    labels=labels,
+                    covariance_type=detector.covariance_type,
+                    n_paths=500,
+                    n_steps=mc_n_steps,
+                )
+
+            if stress_results:
+                # Summary table
+                stress_rows = []
+                for sr in stress_results:
+                    stress_rows.append({
+                        "Scenario": sr.name,
+                        "Description": sr.description,
+                        "Median Return": f"{sr.median_return:+.2%}",
+                        "VaR (95%)": f"{sr.var_95:+.2%}",
+                        "CVaR (95%)": f"{sr.cvar_95:+.2%}",
+                        "Median MDD": f"{np.median(sr.max_drawdowns):.2%}",
+                    })
+                st.dataframe(pd.DataFrame(stress_rows), use_container_width=True)
+
+                # Scenario equity fan charts
+                for sr in stress_results:
+                    with st.expander(f"{sr.name}: {sr.description}"):
+                        # Compute percentile bands for this scenario
+                        sc_bands = {}
+                        for pct in [5, 25, 50, 75, 95]:
+                            sc_bands[pct] = np.percentile(sr.equity_paths, pct, axis=0)
+
+                        sc_x = list(range(sr.equity_paths.shape[1]))
+                        fig_sc = go.Figure()
+                        fig_sc.add_trace(go.Scatter(
+                            x=sc_x + sc_x[::-1],
+                            y=list(sc_bands[95]) + list(sc_bands[5])[::-1],
+                            fill="toself", fillcolor="rgba(239, 68, 68, 0.08)",
+                            line=dict(color="rgba(0,0,0,0)"), name="5th-95th",
+                        ))
+                        fig_sc.add_trace(go.Scatter(
+                            x=sc_x + sc_x[::-1],
+                            y=list(sc_bands[75]) + list(sc_bands[25])[::-1],
+                            fill="toself", fillcolor="rgba(239, 68, 68, 0.18)",
+                            line=dict(color="rgba(0,0,0,0)"), name="25th-75th",
+                        ))
+                        fig_sc.add_trace(go.Scatter(
+                            x=sc_x, y=list(sc_bands[50]),
+                            mode="lines", name="Median",
+                            line=dict(color="#ef4444", width=2),
+                        ))
+                        fig_sc.add_hline(y=mc_engine.initial_capital, line_dash="dot",
+                                         line_color="#64748b")
+                        fig_sc.update_layout(
+                            template="plotly_dark", height=300,
+                            xaxis_title="Step", yaxis_title="Equity ($)",
+                            title=sr.name,
+                        )
+                        st.plotly_chart(fig_sc, use_container_width=True)
+
+                        sc_col1, sc_col2, sc_col3 = st.columns(3)
+                        with sc_col1:
+                            st.metric("Median Return", f"{sr.median_return:+.2%}")
+                        with sc_col2:
+                            st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
+                        with sc_col3:
+                            st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────
