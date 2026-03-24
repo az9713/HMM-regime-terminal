@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from changepoint import BOCDEngine
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -520,9 +521,16 @@ if run_btn:
 
     st.success(f"Selected {detector.n_states} states (BIC)")
 
+    # ── Run BOCD for changepoint detection ──
+    with st.spinner("Running Bayesian Online Changepoint Detection..."):
+        bocd_engine = BOCDEngine(config)
+        bocd_result = bocd_engine.detect_on_features(df, feature_cols=["log_return"])
+        bocd_stability = bocd_engine.regime_stability_score(bocd_result)
+        bocd_confirmed = bocd_engine.changepoint_confirmation(bocd_result, window=10)
+
     # ── Compute confirmations and signals ──
     sig_gen = SignalGenerator(config)
-    df_conf = sig_gen.compute_confirmations(df)
+    df_conf = sig_gen.compute_confirmations(df, config)
     signals = sig_gen.generate_signals(df_conf, states, posteriors, labels, confidence)
 
     # Add regime labels to df
@@ -533,10 +541,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Changepoint Detection",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1728,187 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Changepoint Detection ────────────────────────────────────
+
+    with tab10:
+        st.header("Bayesian Online Changepoint Detection")
+        st.caption(
+            "Adams & MacKay (2007) — real-time, causal detection of regime shifts. "
+            "Unlike the HMM (which smooths over surrounding data), BOCD maintains "
+            "a run-length posterior and fires the instant the generative process changes."
+        )
+
+        # Metrics row
+        cp_col1, cp_col2, cp_col3, cp_col4 = st.columns(4)
+        n_changepoints = len(bocd_result.changepoints)
+        current_rl = int(bocd_result.map_run_length[-1]) if len(bocd_result.map_run_length) > 0 else 0
+        current_cp_prob = float(bocd_result.changepoint_prob[-1]) if len(bocd_result.changepoint_prob) > 0 else 0
+        current_stability = float(bocd_stability[-1]) if len(bocd_stability) > 0 else 0
+
+        with cp_col1:
+            st.metric("Changepoints Detected", n_changepoints)
+        with cp_col2:
+            st.metric("Current Run Length", f"{current_rl} bars")
+        with cp_col3:
+            st.metric("P(Changepoint Now)", f"{current_cp_prob:.1%}")
+        with cp_col4:
+            st.metric("Regime Stability", f"{current_stability:.1%}")
+
+        # Price + changepoint probability overlay
+        fig_cp = make_subplots(
+            rows=3, cols=1, shared_xaxes=True,
+            row_heights=[0.45, 0.30, 0.25],
+            subplot_titles=("Price with Changepoint Markers", "Changepoint Probability", "Run Length"),
+            vertical_spacing=0.06,
+        )
+
+        x_axis = df["Datetime"] if "Datetime" in df.columns else df.index
+
+        # Price trace
+        fig_cp.add_trace(go.Scatter(
+            x=x_axis, y=df["Close"], mode="lines",
+            name="Close", line=dict(color="#64748b", width=1),
+        ), row=1, col=1)
+
+        # Detected changepoints as vertical markers on price
+        if n_changepoints > 0:
+            cp_x = [x_axis.iloc[i] if hasattr(x_axis, 'iloc') else x_axis[i]
+                     for i in bocd_result.changepoints if i < len(x_axis)]
+            cp_y = [df["Close"].iloc[i] for i in bocd_result.changepoints if i < len(df)]
+            fig_cp.add_trace(go.Scatter(
+                x=cp_x, y=cp_y, mode="markers",
+                marker=dict(color="#ef4444", size=10, symbol="diamond"),
+                name="Changepoint",
+            ), row=1, col=1)
+
+        # Regime color background on price chart
+        regime_colors_map = {
+            "bull": "rgba(0, 229, 153, 0.08)", "bull_run": "rgba(0, 229, 153, 0.15)",
+            "bear": "rgba(239, 68, 68, 0.08)", "crash": "rgba(239, 68, 68, 0.15)",
+            "neutral": "rgba(100, 116, 139, 0.06)",
+        }
+        for regime_name, color in regime_colors_map.items():
+            mask = df["regime"] == regime_name
+            if mask.any():
+                fig_cp.add_trace(go.Scatter(
+                    x=x_axis, y=df["Close"].where(mask),
+                    mode="lines", fill="tozeroy", fillcolor=color,
+                    line=dict(color="rgba(0,0,0,0)"), name=regime_name,
+                    showlegend=False,
+                ), row=1, col=1)
+
+        # Changepoint probability trace
+        fig_cp.add_trace(go.Scatter(
+            x=x_axis, y=bocd_result.changepoint_prob,
+            mode="lines", name="P(changepoint)",
+            line=dict(color="#f59e0b", width=1.5),
+            fill="tozeroy", fillcolor="rgba(245, 158, 11, 0.15)",
+        ), row=2, col=1)
+
+        # Threshold line
+        fig_cp.add_hline(
+            y=bocd_engine.threshold, row=2, col=1,
+            line_dash="dash", line_color="#ef4444",
+            annotation_text=f"threshold={bocd_engine.threshold}",
+        )
+
+        # Smoothed confirmation signal
+        fig_cp.add_trace(go.Scatter(
+            x=x_axis, y=bocd_confirmed,
+            mode="lines", name="Confirmed (rolling max)",
+            line=dict(color="#ef4444", width=1, dash="dot"),
+        ), row=2, col=1)
+
+        # Run length trace
+        fig_cp.add_trace(go.Scatter(
+            x=x_axis, y=bocd_result.map_run_length,
+            mode="lines", name="MAP run length",
+            line=dict(color="#3b82f6", width=1.5),
+            fill="tozeroy", fillcolor="rgba(59, 130, 246, 0.1)",
+        ), row=3, col=1)
+
+        fig_cp.update_layout(
+            template="plotly_dark", height=700,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        fig_cp.update_yaxes(title_text="Price ($)", row=1, col=1)
+        fig_cp.update_yaxes(title_text="P(CP)", row=2, col=1)
+        fig_cp.update_yaxes(title_text="Run Length", row=3, col=1)
+
+        st.plotly_chart(fig_cp, use_container_width=True)
+
+        # Regime stability vs HMM entropy comparison
+        st.subheader("BOCD Stability vs HMM Entropy Confidence")
+        st.caption(
+            "Two orthogonal measures: HMM confidence (entropy-based) asks 'how sure is the model "
+            "about which regime we're in?', while BOCD stability asks 'how long has the current "
+            "regime been running?' — they agree when regimes are clear, but diverge at transitions."
+        )
+
+        fig_compare = go.Figure()
+        fig_compare.add_trace(go.Scatter(
+            x=x_axis, y=confidence,
+            mode="lines", name="HMM Confidence (entropy)",
+            line=dict(color="#00e599", width=1.5),
+        ))
+        fig_compare.add_trace(go.Scatter(
+            x=x_axis, y=bocd_stability,
+            mode="lines", name="BOCD Stability (run length)",
+            line=dict(color="#3b82f6", width=1.5),
+        ))
+
+        # Mark where they diverge significantly
+        divergence = np.abs(confidence - bocd_stability)
+        high_div = divergence > 0.3
+        if high_div.any():
+            div_x = [x_axis.iloc[i] if hasattr(x_axis, 'iloc') else x_axis[i]
+                      for i in range(len(high_div)) if high_div[i]]
+            div_y = [float(confidence[i]) for i in range(len(high_div)) if high_div[i]]
+            fig_compare.add_trace(go.Scatter(
+                x=div_x, y=div_y, mode="markers",
+                marker=dict(color="#f59e0b", size=4, symbol="circle"),
+                name="Divergence > 0.3",
+            ))
+
+        fig_compare.update_layout(
+            template="plotly_dark", height=350,
+            yaxis_title="Score (0-1)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_compare, use_container_width=True)
+
+        # Changepoint log table
+        if n_changepoints > 0:
+            st.subheader("Detected Changepoints")
+            cp_records = []
+            for cp_idx in bocd_result.changepoints:
+                if cp_idx >= len(df):
+                    continue
+                cp_time = x_axis.iloc[cp_idx] if hasattr(x_axis, 'iloc') else x_axis[cp_idx]
+                regime_at = df["regime"].iloc[cp_idx] if cp_idx < len(df) else "unknown"
+                regime_before = df["regime"].iloc[cp_idx - 1] if cp_idx > 0 else "unknown"
+                cp_records.append({
+                    "Bar": cp_idx,
+                    "Time": cp_time,
+                    "P(CP)": f"{bocd_result.changepoint_prob[cp_idx]:.3f}",
+                    "Regime Before": regime_before,
+                    "Regime After": regime_at,
+                    "HMM Confidence": f"{confidence[cp_idx]:.1%}",
+                    "Transition": regime_before != regime_at,
+                })
+            st.dataframe(pd.DataFrame(cp_records), use_container_width=True)
+
+            # Stats
+            confirmed_transitions = sum(1 for r in cp_records if r["Transition"])
+            st.info(
+                f"Of {n_changepoints} BOCD changepoints, {confirmed_transitions} "
+                f"coincide with HMM regime transitions ({confirmed_transitions/max(n_changepoints,1):.0%} agreement). "
+                f"BOCD changepoints that DON'T match HMM transitions are potential "
+                f"early warnings of regime shifts the HMM hasn't caught yet."
+            )
+        else:
+            st.info("No changepoints detected above the threshold. Try lowering the threshold or hazard_lambda in config.")
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────

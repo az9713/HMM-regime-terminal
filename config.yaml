@@ -38,7 +38,9 @@ strategy:
     macd_slow: 26
     macd_signal: 9
     min_confidence: 0.6        # entropy-based regime confidence
-  min_confirmations: 4         # out of 8 conditions
+    use_changepoint: true      # 9th confirmation: BOCD regime stability
+    changepoint_window: 10     # lookback for recent changepoint detection
+  min_confirmations: 5         # out of 9 conditions
   cooldown_bars: 5
   min_hold_bars: 10
   hysteresis_bars: 3           # regime must persist this long
@@ -68,6 +70,16 @@ monte_carlo:
   n_steps: 252                     # bars per path (252 ≈ 1 trading year daily)
   ruin_threshold: 0.5              # equity fraction defining ruin (50% loss)
   seed: 42                         # reproducibility
+
+changepoint:
+  hazard_lambda: 200           # expected regime duration (bars) — geometric prior
+  threshold: 0.5               # P(changepoint) threshold for detection
+  prior_mu: 0.0                # Normal-Inverse-Gamma prior mean
+  prior_kappa: 1.0             # prior precision scaling
+  prior_alpha: 1.0             # IG shape
+  prior_beta: 1.0              # IG scale
+  min_run_length: 5            # minimum bars between detected changepoints
+  store_posterior: false        # store full run-length posterior (memory-heavy)
 
 backtest:
   train_window_bars: 500

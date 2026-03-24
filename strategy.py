@@ -11,6 +11,8 @@ import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import ADXIndicator, EMAIndicator, MACD
 
+from changepoint import BOCDEngine
+
 
 class SignalGenerator:
     """Generate trading signals with multi-confirmation gating."""
@@ -38,6 +40,10 @@ class SignalGenerator:
         self.min_hold_bars = strat.get("min_hold_bars", 10)
         self.hysteresis_bars = strat.get("hysteresis_bars", 3)
 
+        # BOCD confirmation: penalize signals during detected changepoints
+        self.use_changepoint = conf.get("use_changepoint", True)
+        self.changepoint_window = conf.get("changepoint_window", 10)
+
         self.use_kelly = risk.get("use_kelly", True)
         self.kelly_fraction = risk.get("kelly_fraction", 0.5)
         self.use_entropy_scaling = risk.get("use_entropy_scaling", True)
@@ -46,9 +52,9 @@ class SignalGenerator:
         self.stop_loss_pct = risk.get("stop_loss_pct", 0.05)
         self.take_profit_pct = risk.get("take_profit_pct", 0.15)
 
-    def compute_confirmations(self, df: pd.DataFrame) -> pd.DataFrame:
+    def compute_confirmations(self, df: pd.DataFrame, config: dict | None = None) -> pd.DataFrame:
         """
-        Compute 8 boolean confirmation conditions:
+        Compute 9 boolean confirmation conditions:
           1. RSI not overbought (RSI < overbought threshold for longs)
           2. RSI not oversold (RSI > oversold threshold — avoid catching knife)
           3. Positive momentum (close > close[momentum_window] bars ago)
@@ -57,6 +63,7 @@ class SignalGenerator:
           6. ADX above threshold (trending market)
           7. Price above EMA (trend confirmation)
           8. MACD bullish (MACD line > signal line)
+          9. Regime stable (no BOCD changepoint detected recently)
         """
         out = df.copy()
 
@@ -92,6 +99,24 @@ class SignalGenerator:
         macd = MACD(out["Close"], window_slow=self.macd_slow,
                      window_fast=self.macd_fast, window_sign=self.macd_signal)
         out["conf_macd"] = macd.macd() > macd.macd_signal()
+
+        # 9. BOCD regime stability: no changepoint detected in recent window
+        if self.use_changepoint and "log_return" in out.columns:
+            try:
+                bocd = BOCDEngine(config or {})
+                bocd_result = bocd.detect_on_features(out, feature_cols=["log_return"])
+                confirmed_cp = bocd.changepoint_confirmation(
+                    bocd_result, window=self.changepoint_window
+                )
+                # Regime is "stable" when no recent changepoint detected
+                out["conf_regime_stable"] = confirmed_cp < bocd.threshold
+                out["changepoint_prob"] = bocd_result.changepoint_prob
+            except Exception:
+                out["conf_regime_stable"] = True
+                out["changepoint_prob"] = 0.0
+        else:
+            out["conf_regime_stable"] = True
+            out["changepoint_prob"] = 0.0
 
         conf_cols = [c for c in out.columns if c.startswith("conf_")]
         out["n_confirmations"] = out[conf_cols].sum(axis=1)
