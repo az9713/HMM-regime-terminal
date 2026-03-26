@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from changepoint import BayesianChangepointDetector, ensemble_hmm_bocpd, compute_detection_lead
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +534,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Regime Radar",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1721,194 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Regime Radar (BOCPD + HMM Ensemble) ─────────────────────
+
+    with tab10:
+        st.subheader("Regime Radar — Bayesian Changepoint Detection")
+        st.caption(
+            "Ensembles HMM regime detection with Bayesian Online Changepoint Detection "
+            "(Adams & MacKay 2007). HMM identifies *which* regime — BOCPD detects *when* "
+            "it changes, often several bars earlier."
+        )
+
+        with st.spinner("Running Bayesian Changepoint Detection..."):
+            log_returns = df["log_return"].values
+            cp_detector = BayesianChangepointDetector(config)
+            bocpd_result = cp_detector.detect(log_returns)
+
+            radar_df = ensemble_hmm_bocpd(
+                hmm_states=states,
+                hmm_posteriors=posteriors,
+                hmm_entropy=entropy,
+                hmm_confidence=confidence,
+                hmm_labels=labels,
+                bocpd_result=bocpd_result,
+            )
+
+            hmm_transitions = [int(t) for t in range(1, len(states)) if states[t] != states[t - 1]]
+            lead_stats = compute_detection_lead(hmm_transitions, bocpd_result.detected_changepoints)
+
+        # ── Detection Lead Summary ──
+        st.markdown("---")
+        lead_col1, lead_col2, lead_col3, lead_col4 = st.columns(4)
+        with lead_col1:
+            mean_lead = lead_stats["mean_lead"]
+            lead_label = f"{abs(mean_lead):.1f} bars {'earlier' if mean_lead > 0 else 'later'}"
+            st.metric("BOCPD vs HMM", lead_label,
+                      help="Avg bars BOCPD detects changes before (positive) or after HMM")
+        with lead_col2:
+            st.metric("BOCPD Early %", f"{lead_stats['bocpd_early_pct']:.0%}",
+                      help="Fraction of transitions BOCPD detected first")
+        with lead_col3:
+            st.metric("Matched Transitions", f"{lead_stats['n_matched']}",
+                      help="Regime changes detected by both methods")
+        with lead_col4:
+            st.metric("BOCPD Changepoints", f"{len(bocpd_result.detected_changepoints)}",
+                      help="Total changepoints detected by BOCPD")
+
+        # ── Regime Radar Chart: Price + Changepoint Prob + Run Length ──
+        st.markdown("---")
+        st.subheader("Regime Radar Overlay")
+
+        prices = df["Close"].values
+        x_axis = list(range(len(prices)))
+
+        fig_radar = make_subplots(
+            rows=3, cols=1, shared_xaxes=True,
+            row_heights=[0.45, 0.275, 0.275],
+            vertical_spacing=0.04,
+            subplot_titles=("Price with Changepoints", "Changepoint Score", "Expected Run Length"),
+        )
+
+        # Row 1: Price with regime coloring and changepoint markers
+        fig_radar.add_trace(go.Scatter(
+            x=x_axis, y=prices, mode="lines", name="Price",
+            line=dict(color="#e2e8f0", width=1.2),
+        ), row=1, col=1)
+
+        # Mark BOCPD changepoints on price
+        for cp in bocpd_result.detected_changepoints:
+            if 0 <= cp < len(prices):
+                fig_radar.add_trace(go.Scatter(
+                    x=[cp], y=[prices[cp]], mode="markers",
+                    marker=dict(color="#06b6d4", size=10, symbol="diamond",
+                                line=dict(color="white", width=1)),
+                    name="BOCPD CP", showlegend=(cp == bocpd_result.detected_changepoints[0]),
+                    legendgroup="bocpd",
+                ), row=1, col=1)
+
+        # Mark HMM transitions on price
+        for i, tr in enumerate(hmm_transitions):
+            if 0 <= tr < len(prices):
+                fig_radar.add_trace(go.Scatter(
+                    x=[tr], y=[prices[tr]], mode="markers",
+                    marker=dict(color="#f59e0b", size=8, symbol="triangle-up",
+                                line=dict(color="white", width=1)),
+                    name="HMM Transition", showlegend=(i == 0),
+                    legendgroup="hmm_tr",
+                ), row=1, col=1)
+
+        # Row 2: Changepoint score
+        fig_radar.add_trace(go.Scatter(
+            x=x_axis, y=radar_df["regime_change_score"].values,
+            mode="lines", name="Change Score",
+            line=dict(color="#06b6d4", width=1.5),
+            fill="tozeroy", fillcolor="rgba(6, 182, 212, 0.15)",
+        ), row=2, col=1)
+
+        # Early warning signal
+        early_warn = radar_df["early_warning"].values
+        if np.max(early_warn) > 0.1:
+            fig_radar.add_trace(go.Scatter(
+                x=x_axis, y=early_warn,
+                mode="lines", name="Early Warning",
+                line=dict(color="#ef4444", width=1.5, dash="dot"),
+            ), row=2, col=1)
+
+        # Threshold line
+        fig_radar.add_hline(y=cp_detector.threshold, row=2, col=1,
+                            line_dash="dash", line_color="#64748b", line_width=0.8)
+
+        # Row 3: Expected run length
+        fig_radar.add_trace(go.Scatter(
+            x=x_axis, y=bocpd_result.expected_run_length,
+            mode="lines", name="Run Length",
+            line=dict(color="#00e599", width=1.5),
+            fill="tozeroy", fillcolor="rgba(0, 229, 153, 0.1)",
+        ), row=3, col=1)
+
+        fig_radar.update_layout(
+            template="plotly_dark", height=700,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            margin=dict(t=60),
+        )
+        fig_radar.update_yaxes(title_text="Price", row=1, col=1)
+        fig_radar.update_yaxes(title_text="Score", row=2, col=1)
+        fig_radar.update_yaxes(title_text="Bars", row=3, col=1)
+        fig_radar.update_xaxes(title_text="Bar", row=3, col=1)
+        st.plotly_chart(fig_radar, use_container_width=True)
+
+        # ── Consensus Confidence vs HMM Confidence ──
+        st.markdown("---")
+        st.subheader("Consensus Confidence (HMM + BOCPD)")
+        st.caption(
+            "Blue = HMM-only confidence. Green = ensemble consensus (boosted when both "
+            "methods agree, reduced when BOCPD warns of change HMM hasn't caught)."
+        )
+
+        fig_conf = go.Figure()
+        fig_conf.add_trace(go.Scatter(
+            x=x_axis, y=radar_df["hmm_confidence"].values,
+            mode="lines", name="HMM Confidence",
+            line=dict(color="#3b82f6", width=1, dash="dot"),
+        ))
+        fig_conf.add_trace(go.Scatter(
+            x=x_axis, y=radar_df["consensus_confidence"].values,
+            mode="lines", name="Consensus Confidence",
+            line=dict(color="#00e599", width=2),
+        ))
+        fig_conf.add_trace(go.Scatter(
+            x=x_axis, y=radar_df["regime_stability"].values,
+            mode="lines", name="Regime Stability",
+            line=dict(color="#f59e0b", width=1.2, dash="dash"),
+        ))
+        fig_conf.update_layout(
+            template="plotly_dark", height=350,
+            yaxis_title="Score (0-1)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_conf, use_container_width=True)
+
+        # ── BOCPD Segments Table ──
+        st.markdown("---")
+        st.subheader("Detected Regime Segments")
+        if bocpd_result.segments:
+            seg_df = pd.DataFrame(bocpd_result.segments)
+            seg_df["mean"] = seg_df["mean"].map(lambda x: f"{x:+.4f}")
+            seg_df["std"] = seg_df["std"].map(lambda x: f"{x:.4f}")
+            seg_df["cumulative"] = seg_df["cumulative"].map(lambda x: f"{x:+.4f}")
+            st.dataframe(seg_df, use_container_width=True)
+        else:
+            st.info("No changepoints detected with current threshold.")
+
+        # ── Detection Lead Table ──
+        if lead_stats["matched_pairs"]:
+            st.markdown("---")
+            st.subheader("Detection Lead: BOCPD vs HMM")
+            st.caption(
+                "Positive lead = BOCPD detected the regime change first. "
+                "This is the core value of the ensemble: earlier warning."
+            )
+            lead_rows = []
+            for hmm_bar, bocpd_bar, lead in lead_stats["matched_pairs"]:
+                lead_rows.append({
+                    "HMM Bar": hmm_bar,
+                    "BOCPD Bar": bocpd_bar,
+                    "Lead (bars)": lead,
+                    "Faster": "BOCPD" if lead > 0 else ("HMM" if lead < 0 else "Tied"),
+                })
+            st.dataframe(pd.DataFrame(lead_rows), use_container_width=True)
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────
