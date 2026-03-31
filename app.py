@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from changepoint import BayesianChangepoint
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -440,6 +441,30 @@ with st.sidebar:
     step_bars = st.slider("Step size (bars)", 10, 200,
                           base_config["backtest"]["step_bars"], 10)
 
+    st.header("Changepoint Detection")
+    enable_bocpd = st.checkbox(
+        "Enable BOCPD",
+        base_config.get("changepoint", {}).get("enabled", True),
+        help="Bayesian Online Changepoint Detection — detects regime changes in real-time",
+    )
+    bocpd_hazard = st.slider(
+        "Hazard λ (expected bars between changepoints)", 50, 500,
+        base_config.get("changepoint", {}).get("hazard_lambda", 200), 10,
+    )
+    bocpd_threshold = st.slider(
+        "Changepoint threshold", 0.05, 0.8,
+        base_config.get("changepoint", {}).get("threshold", 0.3), 0.05,
+    )
+    bocpd_blend = st.slider(
+        "Confidence blend weight", 0.0, 1.0,
+        base_config.get("changepoint", {}).get("blend_weight", 0.3), 0.05,
+    )
+    bocpd_as_conf = st.checkbox(
+        "Use as 9th confirmation gate",
+        base_config.get("changepoint", {}).get("use_as_confirmation", True),
+        help="Require regime stability above threshold to pass confirmation",
+    )
+
     st.header("Multi-Timeframe")
     enable_mtf = st.checkbox("Enable Multi-Timeframe Fusion", False)
     mtf_intervals_options = ["1m", "5m", "15m", "1h", "1d"]
@@ -468,6 +493,10 @@ def build_config():
                    "use_entropy_scaling": use_entropy, "max_leverage": max_leverage}
     cfg["backtest"] = {**base_config["backtest"], "train_window_bars": train_window,
                        "test_window_bars": test_window, "step_bars": step_bars}
+    cfg["changepoint"] = {**base_config.get("changepoint", {}),
+                          "enabled": enable_bocpd, "hazard_lambda": bocpd_hazard,
+                          "threshold": bocpd_threshold, "blend_weight": bocpd_blend,
+                          "use_as_confirmation": bocpd_as_conf}
     return cfg
 
 # ── Regime color map ─────────────────────────────────────────────────────────
@@ -520,16 +549,37 @@ if run_btn:
 
     st.success(f"Selected {detector.n_states} states (BIC)")
 
+    # ── Run BOCPD (Bayesian Online Changepoint Detection) ──
+    cp_cfg = config.get("changepoint", {})
+    use_changepoint = cp_cfg.get("enabled", False)
+    bocpd_result = None
+    fused_confidence = confidence.copy()
+
+    if use_changepoint:
+        with st.spinner("Running Bayesian Changepoint Detection..."):
+            bocpd = BayesianChangepoint(config)
+            bocpd_result = bocpd.detect(X)
+            fused_confidence = bocpd.merge_with_hmm_confidence(
+                confidence, bocpd_result, cp_cfg.get("blend_weight", 0.3)
+            )
+            df["regime_stability"] = bocpd_result.regime_stability
+        st.success(f"BOCPD: {len(bocpd_result.changepoint_indices)} changepoints detected")
+
     # ── Compute confirmations and signals ──
     sig_gen = SignalGenerator(config)
     df_conf = sig_gen.compute_confirmations(df)
-    signals = sig_gen.generate_signals(df_conf, states, posteriors, labels, confidence)
+    signals = sig_gen.generate_signals(
+        df_conf, states, posteriors, labels, fused_confidence
+    )
 
     # Add regime labels to df
     df["regime"] = [labels.get(s, "unknown") for s in states]
     df["confidence"] = confidence
+    df["fused_confidence"] = fused_confidence
     df["entropy"] = entropy
     df["signal"] = signals.values
+    if bocpd_result is not None:
+        df["changepoint_prob"] = bocpd_result.changepoint_prob
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
@@ -564,8 +614,22 @@ if run_btn:
                         f"margin-top:4px'>{signal_text}</div>",
                         unsafe_allow_html=True)
         with col3:
-            pos_size = sig_gen.compute_position_size(last["confidence"])
+            pos_size = sig_gen.compute_position_size(last["fused_confidence"])
             st.metric("Position Size", f"{pos_size:.1%}")
+
+        # BOCPD status row
+        if bocpd_result is not None:
+            cp_c1, cp_c2, cp_c3 = st.columns(3)
+            with cp_c1:
+                cp_last = float(bocpd_result.changepoint_prob[-1])
+                cp_color = "#ef4444" if cp_last > cp_cfg.get("threshold", 0.3) else "#00e599"
+                st.metric("P(Changepoint)", f"{cp_last:.1%}")
+            with cp_c2:
+                stability = float(bocpd_result.regime_stability[-1])
+                st.metric("Regime Stability", f"{stability:.1%}")
+            with cp_c3:
+                fused_pct = float(fused_confidence[-1]) * 100
+                st.metric("Fused Confidence", f"{fused_pct:.1f}%")
 
         st.subheader("Confirmation Breakdown")
         conf_cols = [c for c in df_conf.columns if c.startswith("conf_")]
@@ -990,6 +1054,97 @@ if run_btn:
         )
         fig_corr.update_layout(height=400)
         st.plotly_chart(fig_corr, use_container_width=True)
+
+        # BOCPD: Changepoint Detection panel
+        if bocpd_result is not None:
+            st.markdown("---")
+            st.subheader("Bayesian Online Changepoint Detection (BOCPD)")
+
+            col_cp1, col_cp2 = st.columns(2)
+
+            with col_cp1:
+                # Changepoint probability over time with price overlay
+                fig_cp = make_subplots(specs=[[{"secondary_y": True}]])
+                fig_cp.add_trace(go.Scatter(
+                    x=x_vals, y=df["Close"].values, mode="lines",
+                    line=dict(color="#64748b", width=1), name="Price",
+                    opacity=0.5,
+                ), secondary_y=False)
+                fig_cp.add_trace(go.Scatter(
+                    x=x_vals, y=bocpd_result.changepoint_prob, mode="lines",
+                    line=dict(color="#ef4444", width=1.5), name="P(Changepoint)",
+                    fill="tozeroy", fillcolor="rgba(239,68,68,0.15)",
+                ), secondary_y=True)
+                # Threshold line
+                cp_threshold = cp_cfg.get("threshold", 0.3)
+                fig_cp.add_hline(
+                    y=cp_threshold, line_dash="dash", line_color="#fbbf24",
+                    annotation_text=f"threshold={cp_threshold}",
+                    secondary_y=True,
+                )
+                fig_cp.update_yaxes(title_text="Price", secondary_y=False)
+                fig_cp.update_yaxes(title_text="P(Changepoint)", range=[0, 1], secondary_y=True)
+                fig_cp.update_layout(
+                    height=400, title="Changepoint Probability vs Price",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                )
+                st.plotly_chart(fig_cp, use_container_width=True)
+
+            with col_cp2:
+                # Fused confidence vs raw HMM confidence
+                fig_fused = go.Figure()
+                fig_fused.add_trace(go.Scatter(
+                    x=x_vals, y=confidence, mode="lines",
+                    line=dict(color="teal", width=1, dash="dot"), name="HMM Confidence",
+                    opacity=0.6,
+                ))
+                fig_fused.add_trace(go.Scatter(
+                    x=x_vals, y=fused_confidence, mode="lines",
+                    line=dict(color="#00e599", width=2), name="Fused Confidence (HMM × BOCPD)",
+                ))
+                fig_fused.update_layout(
+                    height=400, title="HMM vs Fused Confidence",
+                    yaxis_title="Confidence", yaxis_range=[0, 1],
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                )
+                st.plotly_chart(fig_fused, use_container_width=True)
+
+            # Expected run length
+            fig_rl = go.Figure()
+            fig_rl.add_trace(go.Scatter(
+                x=x_vals, y=bocpd_result.expected_run_length, mode="lines",
+                line=dict(color="#06b6d4", width=1.5), name="E[Run Length]",
+                fill="tozeroy", fillcolor="rgba(6,182,212,0.1)",
+            ))
+            # Mark detected changepoints
+            if len(bocpd_result.changepoint_indices) > 0:
+                cp_x = [x_vals[i] for i in bocpd_result.changepoint_indices if i < len(x_vals)]
+                cp_y = [bocpd_result.expected_run_length[i] for i in bocpd_result.changepoint_indices if i < len(x_vals)]
+                fig_rl.add_trace(go.Scatter(
+                    x=cp_x, y=cp_y, mode="markers",
+                    marker=dict(color="#ef4444", size=8, symbol="triangle-down"),
+                    name="Changepoints",
+                ))
+            fig_rl.update_layout(
+                height=350, title="Expected Run Length (bars since last changepoint)",
+                yaxis_title="Bars",
+            )
+            st.plotly_chart(fig_rl, use_container_width=True)
+
+            # Summary metrics
+            n_cp = len(bocpd_result.changepoint_indices)
+            avg_stability = float(np.mean(bocpd_result.regime_stability))
+            avg_run = float(np.mean(bocpd_result.expected_run_length))
+            cp_m1, cp_m2, cp_m3, cp_m4 = st.columns(4)
+            with cp_m1:
+                st.metric("Changepoints Detected", n_cp)
+            with cp_m2:
+                st.metric("Avg Regime Stability", f"{avg_stability:.2%}")
+            with cp_m3:
+                st.metric("Avg Run Length", f"{avg_run:.1f} bars")
+            with cp_m4:
+                confidence_drop = float(np.mean(confidence - fused_confidence))
+                st.metric("Avg Confidence Dampening", f"{confidence_drop:.4f}")
 
     # ── Tab 7: Fundamentals ─────────────────────────────────────────────
 
