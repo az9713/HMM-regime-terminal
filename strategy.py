@@ -38,6 +38,11 @@ class SignalGenerator:
         self.min_hold_bars = strat.get("min_hold_bars", 10)
         self.hysteresis_bars = strat.get("hysteresis_bars", 3)
 
+        # BOCPD confirmation gate
+        cp_cfg = config.get("changepoint", {})
+        self.use_changepoint_confirmation = cp_cfg.get("use_as_confirmation", False)
+        self.stability_threshold = cp_cfg.get("stability_threshold", 0.7)
+
         self.use_kelly = risk.get("use_kelly", True)
         self.kelly_fraction = risk.get("kelly_fraction", 0.5)
         self.use_entropy_scaling = risk.get("use_entropy_scaling", True)
@@ -92,6 +97,10 @@ class SignalGenerator:
         macd = MACD(out["Close"], window_slow=self.macd_slow,
                      window_fast=self.macd_fast, window_sign=self.macd_signal)
         out["conf_macd"] = macd.macd() > macd.macd_signal()
+
+        # 9. Regime stability (BOCPD): no changepoint detected
+        if "regime_stability" in out.columns and self.use_changepoint_confirmation:
+            out["conf_regime_stable"] = out["regime_stability"] >= self.stability_threshold
 
         conf_cols = [c for c in out.columns if c.startswith("conf_")]
         out["n_confirmations"] = out[conf_cols].sum(axis=1)

@@ -63,6 +63,19 @@ multi_timeframe:
     1d: 1.0
     1wk: 1.2
 
+changepoint:
+  enabled: true
+  hazard_lambda: 200              # expected bars between changepoints
+  prior_mu: 0.0                   # NIG prior: mean of means
+  prior_kappa: 0.1                # NIG prior: pseudo-observations for mean
+  prior_alpha: 1.0                # NIG prior: shape (controls variance uncertainty)
+  prior_beta: 0.01                # NIG prior: scale (controls variance scale)
+  threshold: 0.3                  # P(changepoint) above this = regime instability
+  feature_index: 0                # feature to monitor (0 = log_return)
+  blend_weight: 0.3               # how much changepoint prob dampens HMM confidence
+  use_as_confirmation: true       # add regime stability as 9th confirmation gate
+  stability_threshold: 0.7        # min regime_stability to pass confirmation
+
 monte_carlo:
   n_paths: 1000                    # simulated market paths
   n_steps: 252                     # bars per path (252 ≈ 1 trading year daily)

@@ -14,6 +14,7 @@ from data_loader import standardize, get_feature_matrix
 from hmm_engine import RegimeDetector
 from strategy import SignalGenerator
 from regime_analyzer import RegimeTransitionAnalyzer
+from changepoint import BayesianChangepoint
 
 
 @dataclass
@@ -38,6 +39,8 @@ class BacktestResult:
     metrics: dict = field(default_factory=dict)
     regime_series: pd.Series = None
     confidence_series: pd.Series = None
+    changepoint_prob: pd.Series = None
+    fused_confidence: pd.Series = None
     ci_lower: dict = field(default_factory=dict)
     ci_upper: dict = field(default_factory=dict)
     regime_attribution: pd.DataFrame = None
@@ -84,6 +87,14 @@ class WalkForwardBacktester:
         all_sizes = pd.Series(0.0, index=df.index)
         all_regimes = pd.Series("unknown", index=df.index)
         all_confidence = pd.Series(0.0, index=df.index)
+        all_changepoint_prob = pd.Series(0.0, index=df.index)
+        all_fused_confidence = pd.Series(0.0, index=df.index)
+
+        # BOCPD setup
+        cp_cfg = self.config.get("changepoint", {})
+        use_changepoint = cp_cfg.get("enabled", False)
+        blend_weight = cp_cfg.get("blend_weight", 0.3)
+        bocpd = BayesianChangepoint(self.config) if use_changepoint else None
 
         start = 0
         while start + self.train_window + self.test_window <= T:
@@ -112,17 +123,30 @@ class WalkForwardBacktester:
             labels = detector.label_regimes(X_test)
             entropy, confidence = detector.shannon_entropy(posteriors)
 
-            # Generate signals
+            # Run BOCPD on test period features
+            fused_confidence = confidence.copy()
+            cp_prob = np.zeros(len(X_test))
+            if bocpd is not None:
+                bocpd_result = bocpd.detect(X_test)
+                cp_prob = bocpd_result.changepoint_prob
+                fused_confidence = bocpd.merge_with_hmm_confidence(
+                    confidence, bocpd_result, blend_weight
+                )
+                # Inject regime_stability into test_df for confirmation gate
+                test_df = test_df.copy()
+                test_df["regime_stability"] = bocpd_result.regime_stability
+
+            # Generate signals (with changepoint-aware confirmations)
             sig_gen = SignalGenerator(self.config)
             test_with_conf = sig_gen.compute_confirmations(test_df)
             signals = sig_gen.generate_signals(
-                test_with_conf, states, posteriors, labels, confidence
+                test_with_conf, states, posteriors, labels, fused_confidence
             )
 
-            # Position sizing
+            # Position sizing (uses fused confidence)
             sizes = pd.Series(0.0, index=test_df.index)
             for i in range(len(test_df)):
-                sizes.iloc[i] = sig_gen.compute_position_size(confidence[i])
+                sizes.iloc[i] = sig_gen.compute_position_size(fused_confidence[i])
 
             # Store results for this fold
             idx = test_df.index
@@ -131,6 +155,8 @@ class WalkForwardBacktester:
             for i, s in enumerate(states):
                 all_regimes.iloc[train_end + i] = labels.get(s, "unknown")
             all_confidence.loc[idx] = confidence
+            all_changepoint_prob.loc[idx] = cp_prob
+            all_fused_confidence.loc[idx] = fused_confidence
 
             start += self.step_bars
 
@@ -146,6 +172,8 @@ class WalkForwardBacktester:
             trades=trades,
             regime_series=all_regimes,
             confidence_series=all_confidence,
+            changepoint_prob=all_changepoint_prob if use_changepoint else None,
+            fused_confidence=all_fused_confidence if use_changepoint else None,
         )
 
         # Compute metrics
