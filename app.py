@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from regime_forecast import RegimeForecaster
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +534,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
-        "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Regime Forecast", "Backtest Results", "Trade Log", "Model Diagnostics",
+        "Fundamentals", "Multi-Timeframe", "Monte Carlo",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -857,9 +858,295 @@ if run_btn:
                 )
                 st.plotly_chart(fig_alpha, use_container_width=True)
 
-    # ── Tab 4: Backtest Results ──────────────────────────────────────────
+    # ── Tab 4: Regime Forecast ──────────────────────────────────────────
 
     with tab4:
+        st.subheader("Predictive Regime Forecast")
+        st.caption(
+            "Uses Chapman-Kolmogorov dynamics to project regime probabilities forward in time. "
+            "Turns the HMM from a backward-looking detector into a forward-looking forecaster."
+        )
+
+        with st.spinner("Computing regime forecasts..."):
+            fc_horizon = st.slider("Forecast horizon (bars)", 5, 50, 20, key="fc_horizon")
+            forecaster = RegimeForecaster(config, max_horizon=fc_horizon)
+
+            # Current bar forecast
+            current_posterior = posteriors[-1]
+            current_state = states[-1]
+            posterior_hist = posteriors[-10:] if len(posteriors) >= 10 else posteriors
+
+            forecast = forecaster.forecast_at_bar(
+                current_posterior, transmat,
+                detector.model.means_, detector.model.covars_,
+                labels, current_state,
+                covariance_type=detector.covariance_type,
+                posterior_history=posterior_hist,
+            )
+
+            # Series-level forecasts
+            forecast_series = forecaster.forecast_series(
+                posteriors, states, transmat,
+                detector.model.means_, detector.model.covars_,
+                labels, covariance_type=detector.covariance_type,
+            )
+
+        # ── Current Forecast Summary Cards ──
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        with fc1:
+            st.metric("Current Regime", forecast.current_regime.upper())
+        with fc2:
+            st.metric("Regime Half-Life", f"{forecast.half_life:.1f} bars",
+                       help="Expected bars until current regime probability drops below 50%")
+        with fc3:
+            urgency_5 = forecast.transition_prob_curve[min(4, fc_horizon - 1)]
+            st.metric("P(Change in 5 bars)", f"{urgency_5:.1%}",
+                       help="Probability of regime change within next 5 bars")
+        with fc4:
+            vel_norm = float(np.linalg.norm(forecast.posterior_velocity))
+            st.metric("Belief Velocity", f"{vel_norm:.4f}",
+                       help="Magnitude of posterior shift (higher = beliefs changing fast)")
+
+        # ── Most Likely Future Regimes ──
+        st.markdown("---")
+        st.subheader("Regime Outlook")
+        outlook_cols = st.columns(len(forecast.most_likely_next))
+        for i, (h, (regime_label, prob)) in enumerate(sorted(forecast.most_likely_next.items())):
+            with outlook_cols[i]:
+                regime_bg = get_regime_color(regime_label)
+                st.markdown(
+                    f"<div style='text-align:center;padding:12px;border-radius:8px;"
+                    f"background:{regime_bg};color:white;margin-bottom:4px'>"
+                    f"<div style='font-size:11px;opacity:0.8'>+{h} bars</div>"
+                    f"<div style='font-size:18px;font-weight:bold'>{regime_label.upper()}</div>"
+                    f"<div style='font-size:13px'>{prob:.1%}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        # ── N-Step Regime Probability Curves ──
+        st.markdown("---")
+        st.subheader("Regime Probability Forecast")
+        st.caption("How regime probabilities evolve over the forecast horizon (Chapman-Kolmogorov projection)")
+
+        fig_prob = go.Figure()
+        for state_id, label in labels.items():
+            fig_prob.add_trace(go.Scatter(
+                x=list(forecast.horizons),
+                y=forecast.forecast_probs[:, state_id],
+                mode="lines+markers",
+                name=label,
+                line=dict(color=get_regime_color(label), width=2.5),
+                marker=dict(size=4),
+            ))
+        fig_prob.add_hline(y=0.5, line_dash="dot", line_color="#64748b",
+                           annotation_text="50% threshold")
+        fig_prob.update_layout(
+            template="plotly_dark", height=400,
+            xaxis_title="Bars Ahead",
+            yaxis_title="Probability",
+            yaxis=dict(range=[0, 1]),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_prob, use_container_width=True)
+
+        # ── Expected Return Cone ──
+        st.subheader("Expected Return Cone")
+        st.caption("Cumulative return percentiles from regime-mixture distributions")
+
+        cone = forecast.return_cone
+        h_axis = list(forecast.horizons)
+        fig_cone = go.Figure()
+
+        # 5th-95th band
+        fig_cone.add_trace(go.Scatter(
+            x=h_axis + h_axis[::-1],
+            y=list(cone[:, 4] * 100) + list(cone[:, 0] * 100)[::-1],
+            fill="toself", fillcolor="rgba(0, 229, 153, 0.08)",
+            line=dict(color="rgba(0,0,0,0)"), name="5th-95th pct",
+        ))
+        # 25th-75th band
+        fig_cone.add_trace(go.Scatter(
+            x=h_axis + h_axis[::-1],
+            y=list(cone[:, 3] * 100) + list(cone[:, 1] * 100)[::-1],
+            fill="toself", fillcolor="rgba(0, 229, 153, 0.18)",
+            line=dict(color="rgba(0,0,0,0)"), name="25th-75th pct",
+        ))
+        # Median
+        fig_cone.add_trace(go.Scatter(
+            x=h_axis, y=list(cone[:, 2] * 100),
+            mode="lines", name="Median",
+            line=dict(color="#00e599", width=2.5),
+        ))
+        fig_cone.add_hline(y=0, line_dash="solid", line_color="#64748b", line_width=1)
+        fig_cone.update_layout(
+            template="plotly_dark", height=400,
+            xaxis_title="Bars Ahead",
+            yaxis_title="Cumulative Return (%)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_cone, use_container_width=True)
+
+        # ── Transition Countdown ──
+        tc_col1, tc_col2 = st.columns([2, 1])
+
+        with tc_col1:
+            st.subheader("Transition Countdown")
+            st.caption("Probability of leaving current regime by bar N")
+            fig_tc = go.Figure()
+            fig_tc.add_trace(go.Scatter(
+                x=list(forecast.horizons),
+                y=forecast.transition_prob_curve,
+                mode="lines+markers",
+                name="P(regime change)",
+                line=dict(color="#f59e0b", width=2.5),
+                marker=dict(size=4),
+                fill="tozeroy",
+                fillcolor="rgba(245, 158, 11, 0.1)",
+            ))
+            fig_tc.add_hline(y=0.5, line_dash="dot", line_color="#ef4444",
+                             annotation_text="50% chance")
+            fig_tc.update_layout(
+                template="plotly_dark", height=350,
+                xaxis_title="Bars Ahead",
+                yaxis_title="P(Transition)",
+                yaxis=dict(range=[0, 1]),
+            )
+            st.plotly_chart(fig_tc, use_container_width=True)
+
+        with tc_col2:
+            st.subheader("Regime Survival")
+            st.caption("Per-regime persistence curves")
+            fig_surv = go.Figure()
+            for state_id, label in labels.items():
+                survival = forecaster.regime_survival_curve(
+                    transmat, state_id, max_steps=fc_horizon
+                )
+                fig_surv.add_trace(go.Scatter(
+                    x=list(range(1, fc_horizon + 1)),
+                    y=survival,
+                    mode="lines",
+                    name=label,
+                    line=dict(color=get_regime_color(label), width=2),
+                ))
+            fig_surv.update_layout(
+                template="plotly_dark", height=350,
+                xaxis_title="Bars",
+                yaxis_title="P(Still in Regime)",
+                yaxis=dict(range=[0, 1]),
+            )
+            st.plotly_chart(fig_surv, use_container_width=True)
+
+        # ── Mean First-Passage Times ──
+        st.markdown("---")
+        st.subheader("Mean First-Passage Times")
+        st.caption(
+            "Expected number of bars to transition from one regime to another. "
+            "Reveals the structural tempo of regime dynamics."
+        )
+        mfpt = forecaster.regime_absorption_times(transmat, labels)
+        st.dataframe(
+            mfpt.style.format("{:.1f}").background_gradient(cmap="YlOrRd", axis=None),
+            use_container_width=True,
+        )
+
+        # ── Historical Forecast Metrics ──
+        st.markdown("---")
+        st.subheader("Historical Forecast Metrics")
+        st.caption("Per-bar forecast metrics across the full dataset")
+
+        hist_col1, hist_col2 = st.columns(2)
+
+        with hist_col1:
+            fig_hl = go.Figure()
+            fig_hl.add_trace(go.Scatter(
+                x=list(range(len(forecast_series.half_lives))),
+                y=forecast_series.half_lives,
+                mode="lines", name="Regime Half-Life",
+                line=dict(color="#06b6d4", width=1.5),
+            ))
+            fig_hl.update_layout(
+                template="plotly_dark", height=300,
+                title="Regime Half-Life Over Time",
+                xaxis_title="Bar", yaxis_title="Half-Life (bars)",
+            )
+            st.plotly_chart(fig_hl, use_container_width=True)
+
+        with hist_col2:
+            fig_tu = go.Figure()
+            fig_tu.add_trace(go.Scatter(
+                x=list(range(len(forecast_series.transition_urgency))),
+                y=forecast_series.transition_urgency,
+                mode="lines", name="Transition Urgency",
+                line=dict(color="#f59e0b", width=1.5),
+                fill="tozeroy",
+                fillcolor="rgba(245, 158, 11, 0.1)",
+            ))
+            fig_tu.update_layout(
+                template="plotly_dark", height=300,
+                title="Transition Urgency (P(change in 5 bars))",
+                xaxis_title="Bar", yaxis_title="Probability",
+                yaxis=dict(range=[0, 1]),
+            )
+            st.plotly_chart(fig_tu, use_container_width=True)
+
+        # ── Anticipatory Signals vs Reactive Signals ──
+        st.subheader("Anticipatory vs Reactive Signals")
+        st.caption(
+            "Compare traditional regime-reactive signals with forward-looking anticipatory signals. "
+            "Anticipatory signals trade based on where the regime is GOING, not where it IS."
+        )
+
+        fig_sig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                row_heights=[0.6, 0.4],
+                                subplot_titles=["Price + Anticipated Regime", "Signal Comparison"])
+
+        # Price
+        fig_sig.add_trace(go.Scatter(
+            x=list(range(len(df))),
+            y=df["Close"].values,
+            mode="lines", name="Price",
+            line=dict(color="#e2e8f0", width=1),
+        ), row=1, col=1)
+
+        # Color background by anticipated regime
+        for regime_label in set(forecast_series.anticipated_regime):
+            mask = [1 if r == regime_label else None for r in forecast_series.anticipated_regime]
+            prices_masked = [p if m else None for p, m in zip(df["Close"].values, mask)]
+            fig_sig.add_trace(go.Scatter(
+                x=list(range(len(df))),
+                y=prices_masked,
+                mode="lines",
+                name=f"Anticipated: {regime_label}",
+                line=dict(color=get_regime_color(regime_label), width=3),
+                connectgaps=False,
+            ), row=1, col=1)
+
+        # Reactive signals
+        fig_sig.add_trace(go.Scatter(
+            x=list(range(len(df))),
+            y=signals.values,
+            mode="lines", name="Reactive Signal",
+            line=dict(color="#3b82f6", width=1.5),
+        ), row=2, col=1)
+
+        # Anticipatory signals
+        fig_sig.add_trace(go.Scatter(
+            x=list(range(len(df))),
+            y=forecast_series.anticipatory_signals,
+            mode="lines", name="Anticipatory Signal",
+            line=dict(color="#00e599", width=1.5, dash="dash"),
+        ), row=2, col=1)
+
+        fig_sig.update_layout(
+            template="plotly_dark", height=600,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_sig, use_container_width=True)
+
+    # ── Tab 5: Backtest Results ──────────────────────────────────────────
+
+    with tab5:
         with st.spinner("Running walk-forward backtest..."):
             backtester = WalkForwardBacktester(config)
             try:
@@ -927,7 +1214,7 @@ if run_btn:
 
     # ── Tab 5: Trade Log ─────────────────────────────────────────────────
 
-    with tab5:
+    with tab6:
         st.subheader("Trade Log")
         if "bt_result" in dir() and bt_result.trades:
             trade_data = []
@@ -950,7 +1237,7 @@ if run_btn:
 
     # ── Tab 6: Model Diagnostics ─────────────────────────────────────────
 
-    with tab6:
+    with tab7:
         col1, col2 = st.columns(2)
 
         with col1:
@@ -993,7 +1280,7 @@ if run_btn:
 
     # ── Tab 7: Fundamentals ─────────────────────────────────────────────
 
-    with tab7:
+    with tab8:
         if FundamentalAnalyzer.is_crypto(ticker):
             st.warning("Fundamental analysis is not available for crypto assets. "
                        "Crypto tickers do not have traditional financial statements, "
@@ -1297,7 +1584,7 @@ if run_btn:
 
     # ── Tab 8: Multi-Timeframe Fusion ────────────────────────────────────
 
-    with tab8:
+    with tab9:
         if not enable_mtf:
             st.info("Enable **Multi-Timeframe Fusion** in the sidebar and select 2+ timeframes to use this tab.")
         elif len(mtf_intervals) < 2:
@@ -1443,7 +1730,7 @@ if run_btn:
 
     # ── Tab 9: Monte Carlo Simulation ──────────────────────────────────
 
-    with tab9:
+    with tab10:
         st.subheader("Monte Carlo Regime Simulation")
         st.caption(
             "Leverages the HMM's generative model to simulate thousands of "
