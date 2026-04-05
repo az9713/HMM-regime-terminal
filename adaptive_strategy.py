@@ -589,3 +589,4 @@ class AdaptiveStrategyEngine:
             }
             for s in signals
         ])
+
