@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from regime_forecast import RegimeForecastEngine
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +534,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Regime Forecast",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1721,229 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Regime Forecast ────────────────────────────────────────
+
+    with tab10:
+        st.subheader("Regime Forecast Engine")
+        st.caption(
+            "Forward-looking projection of the HMM transition matrix. "
+            "Closed-form Markov-chain analytics — no simulation, no retraining. "
+            "Answers: where will the regime be 1 / 5 / 24 / 168 bars from now, "
+            "how long until I'm likely to hit a crash regime, and what is the "
+            "model's theoretical horizon of predictability."
+        )
+
+        # Build the engine from the already-fitted HMM
+        try:
+            forecast_engine = RegimeForecastEngine(
+                transmat=transmat,
+                state_means=detector.model.means_[:, 0],
+                labels=labels,
+            )
+        except Exception as exc:
+            st.error(f"Failed to build forecast engine: {exc}")
+            st.stop()
+
+        # Starting distribution = today's posterior
+        pi_now = posteriors[-1]
+        current_state = int(np.argmax(pi_now))
+        current_label = labels.get(current_state, f"state_{current_state}")
+
+        fc_col1, fc_col2 = st.columns([1, 1])
+        with fc_col1:
+            fc_horizon = st.slider(
+                "Forecast Horizon (bars)", 12, 720, 168, step=12,
+                help="Maximum number of bars to project forward.",
+            )
+        with fc_col2:
+            available_labels = sorted(set(labels.values()))
+            default_target = "crash" if "crash" in available_labels else available_labels[0]
+            target_label = st.selectbox(
+                "Target Regime (for hitting-time analysis)",
+                options=available_labels,
+                index=available_labels.index(default_target),
+                help="Compute expected number of bars until first hitting this regime.",
+            )
+
+        summary = forecast_engine.forecast_summary(
+            pi_now, target_label=target_label, horizon=fc_horizon
+        )
+
+        # ── Top-line metrics ──
+        st.markdown("#### Forecast Snapshot")
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Current Regime", current_label.upper())
+        with m2:
+            t_mix = summary["mixing_time"]
+            t_mix_str = "∞" if not np.isfinite(t_mix) else f"{t_mix:.1f} bars"
+            st.metric("Mixing Time (ε=1%)", t_mix_str,
+                      help="Theoretical horizon of predictability. Beyond this many "
+                           "bars, the chain has effectively forgotten today's state.")
+        with m3:
+            st.metric("Spectral Gap", f"{summary['spectral_gap']:.4f}",
+                      help="1 - |λ₂|. Larger values mean faster mixing.")
+        with m4:
+            ebt = summary["expected_bars_to_target"]
+            if np.isnan(ebt):
+                ebt_str = "n/a"
+            elif np.isinf(ebt):
+                ebt_str = "∞"
+            else:
+                ebt_str = f"{ebt:.1f} bars"
+            st.metric(f"E[bars → {target_label}]", ebt_str,
+                      help="Expected first-passage time from the current state to the "
+                           "target regime, computed from absorbing-chain analysis.")
+
+        # ── Per-state half-life table ──
+        st.markdown("#### Regime Half-Lives")
+        st.caption("How long each regime is expected to persist before decaying.")
+        hl_df = summary["half_lives"].copy()
+        hl_df["self_loop_prob"] = hl_df["self_loop_prob"].round(4)
+        hl_df["expected_duration"] = hl_df["expected_duration"].round(2)
+        hl_df["half_life"] = hl_df["half_life"].round(2)
+        st.dataframe(hl_df, use_container_width=True, hide_index=True)
+
+        # ── Posterior trajectory chart ──
+        st.markdown("#### Forward Regime Probability Trajectory")
+        traj = summary["trajectory"]
+        fig_traj = go.Figure()
+        for i in range(forecast_engine.n_states):
+            lbl = labels.get(i, f"state_{i}")
+            fig_traj.add_trace(go.Scatter(
+                x=traj.horizons,
+                y=traj.distributions[:, i],
+                mode="lines",
+                stackgroup="one",
+                name=lbl,
+                line=dict(width=0.5, color=get_regime_color(lbl)),
+                fillcolor=get_regime_color(lbl),
+            ))
+        fig_traj.update_layout(
+            template="plotly_dark",
+            height=380,
+            xaxis_title="Bars Ahead",
+            yaxis_title="P(regime)",
+            yaxis=dict(range=[0, 1]),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_traj, use_container_width=True)
+
+        # ── Entropy and expected return cones ──
+        col_e, col_r = st.columns(2)
+        with col_e:
+            st.markdown("#### Forecast Uncertainty (Entropy)")
+            fig_ent = go.Figure()
+            fig_ent.add_trace(go.Scatter(
+                x=traj.horizons, y=traj.entropies,
+                mode="lines", line=dict(color="#06b6d4", width=2),
+                name="Entropy",
+            ))
+            max_h = float(np.log2(forecast_engine.n_states))
+            fig_ent.add_hline(y=max_h, line_dash="dot", line_color="#64748b",
+                              annotation_text=f"max = log₂({forecast_engine.n_states})")
+            fig_ent.update_layout(
+                template="plotly_dark", height=300,
+                xaxis_title="Bars Ahead", yaxis_title="H (bits)",
+            )
+            st.plotly_chart(fig_ent, use_container_width=True)
+
+        with col_r:
+            st.markdown("#### Expected Cumulative Log-Return")
+            fig_ret = go.Figure()
+            fig_ret.add_trace(go.Scatter(
+                x=traj.horizons, y=traj.cumulative_returns,
+                mode="lines",
+                line=dict(color="#00e599", width=2),
+                fill="tozeroy",
+                fillcolor="rgba(0, 229, 153, 0.10)",
+                name="E[Σ log r]",
+            ))
+            fig_ret.add_hline(y=0, line_dash="dot", line_color="#64748b")
+            fig_ret.update_layout(
+                template="plotly_dark", height=300,
+                xaxis_title="Bars Ahead", yaxis_title="Cumulative log-return",
+            )
+            st.plotly_chart(fig_ret, use_container_width=True)
+
+        # ── Snapshot table at fixed horizons ──
+        st.markdown("#### Regime Probabilities at Key Horizons")
+        snapshot_horizons = sorted(set(
+            h for h in [1, 5, 24, 72, 168, fc_horizon] if h <= fc_horizon
+        ))
+        snap_df = forecast_engine.regime_probabilities_at(pi_now, snapshot_horizons)
+        for col in snap_df.columns:
+            if col == "horizon":
+                continue
+            snap_df[col] = snap_df[col].apply(lambda v: f"{v:.3f}" if isinstance(v, float) else v)
+        st.dataframe(snap_df, use_container_width=True, hide_index=True)
+
+        # ── Hitting probability curve ──
+        if not summary["hit_probability_curve"].empty:
+            st.markdown(f"#### Probability of Hitting `{target_label}` Within k Bars")
+            st.caption(
+                "Per-starting-state probability of first reaching the target regime "
+                "by horizon k. Built by making the target set absorbing in the "
+                "transition matrix and propagating each basis state forward."
+            )
+            hit_df = summary["hit_probability_curve"]
+            fig_hit = go.Figure()
+            for col in hit_df.columns:
+                if col == "horizon":
+                    continue
+                fig_hit.add_trace(go.Scatter(
+                    x=hit_df["horizon"], y=hit_df[col],
+                    mode="lines", name=col,
+                    line=dict(color=get_regime_color(col), width=2),
+                ))
+            fig_hit.update_layout(
+                template="plotly_dark", height=340,
+                xaxis_title="Horizon (bars)",
+                yaxis_title=f"P(hit {target_label} by k)",
+                yaxis=dict(range=[0, 1]),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_hit, use_container_width=True)
+
+            # Expected hitting time table
+            st.markdown(f"#### Expected First-Passage Time → `{target_label}`")
+            ht_rows = []
+            for sid, bars in summary["expected_hitting_times"].items():
+                ht_rows.append({
+                    "From State": labels.get(sid, f"state_{sid}"),
+                    "Expected Bars": "0" if bars == 0
+                    else "∞" if not np.isfinite(bars)
+                    else f"{bars:.1f}",
+                })
+            st.dataframe(pd.DataFrame(ht_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info(f"No states are labeled `{target_label}` in this fit.")
+
+        with st.expander("Method"):
+            st.markdown("""
+**Posterior propagation.** Given today's posterior π₀ from the HMM forward pass,
+the k-step ahead distribution is the exact analytic recursion
+`π_k = π₀ · Tᵏ`, where T is the fitted transition matrix. No Monte Carlo needed.
+
+**Mixing time.** From the second-largest-modulus eigenvalue λ₂ of T,
+`t_mix(ε) ≈ ln(1/ε) / (1 − |λ₂|)`. This is the number of bars after which the
+chain's distribution is within ε of stationary in total variation, regardless
+of where it started — a hard upper bound on how far ahead the HMM can usefully
+forecast.
+
+**Half-life.** For each state i with self-loop probability `a_ii`,
+`half_life_i = ln(0.5) / ln(a_ii)`. Expected duration is `1 / (1 − a_ii)`.
+
+**First-passage time.** Make the target states absorbing, partition the
+chain into transient block Q and absorbing block R. The vector of expected
+hitting times satisfies `(I − Q) h = 1`, solved directly. Closed-form,
+no simulation.
+
+**Hit-by-horizon probability.** With the target made absorbing,
+`P(hit by k | start = i) = Σ_{t∈targets} (T_absᵏ)_{i,t}`, monotone
+non-decreasing in k.
+""")
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────
