@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from forecast import ForecastEngine
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +534,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Forecast",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1721,281 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Analytical Forecast ─────────────────────────────────────
+
+    with tab10:
+        st.subheader("Analytical Forecast Engine")
+        st.caption(
+            "Closed-form, posterior-conditioned projection of regimes and "
+            "returns. Complements the unconditional Monte Carlo engine by "
+            "propagating the HMM's current belief forward via the Chapman-"
+            "Kolmogorov equation and the law of total variance."
+        )
+
+        fc_col1, fc_col2, fc_col3 = st.columns(3)
+        with fc_col1:
+            fc_horizon = st.slider(
+                "Forecast horizon (bars)", 5, 200,
+                int(config.get("forecast", {}).get("horizon", 30)),
+                key="fc_horizon",
+            )
+        with fc_col2:
+            fc_risk_aversion = st.slider(
+                "Risk aversion (λ)", 0.1, 10.0,
+                float(config.get("forecast", {}).get("risk_aversion", 1.0)),
+                0.1, key="fc_risk_aversion",
+                help="Higher λ penalizes return variance more heavily in the EU signal.",
+            )
+        with fc_col3:
+            fc_max_size = st.slider(
+                "Max EU size", 0.1, 2.0,
+                float(config.get("forecast", {}).get("max_size", 1.0)),
+                0.1, key="fc_max_size",
+            )
+
+        fc_config = {
+            "forecast": {
+                "horizon": fc_horizon,
+                "risk_aversion": fc_risk_aversion,
+                "max_size": fc_max_size,
+            }
+        }
+        fc_engine = ForecastEngine(fc_config)
+
+        current_posterior = posteriors[-1]
+        fc_result = fc_engine.run(
+            current_posterior=current_posterior,
+            transmat=transmat,
+            means=detector.model.means_,
+            covars=detector.model.covars_,
+            labels=labels,
+            covariance_type=detector.covariance_type,
+            feature_idx=0,
+            horizon=fc_horizon,
+        )
+
+        # ── Summary metrics ──
+        st.markdown("---")
+        horizon_mean = float(fc_result.cumulative_mean[-1])
+        horizon_std = float(np.sqrt(fc_result.cumulative_variance[-1]))
+        horizon_sharpe = horizon_mean / horizon_std if horizon_std > 0 else 0.0
+
+        sm1, sm2, sm3, sm4 = st.columns(4)
+        with sm1:
+            st.metric(
+                f"E[R] over {fc_horizon} bars",
+                f"{horizon_mean * 100:+.2f}%",
+                help="Analytical expected cumulative log return under current belief.",
+            )
+        with sm2:
+            st.metric("σ[R]", f"{horizon_std * 100:.2f}%",
+                      help="Analytical standard deviation of the cumulative log return.")
+        with sm3:
+            st.metric("E[R] / σ[R]", f"{horizon_sharpe:.2f}",
+                      help="Forecast signal-to-noise ratio at the horizon.")
+        with sm4:
+            action_map = {1: "LONG", -1: "SHORT", 0: "FLAT"}
+            st.metric(
+                "EU Action",
+                action_map[fc_result.eu_best_action],
+                f"size {fc_result.eu_recommended_size:.0%}",
+                help="Bayesian-decision-theoretic action that maximizes expected log-wealth.",
+            )
+
+        # ── Regime probability trajectory ──
+        st.markdown("---")
+        st.subheader("Regime Probability Trajectory")
+        st.caption(
+            "How the HMM's belief about each regime evolves over the forecast horizon, "
+            "starting from the current filtered posterior."
+        )
+
+        regime_label_list = [labels.get(i, f"S{i}") for i in range(fc_result.n_states)]
+        step_axis = list(range(fc_result.horizon + 1))
+
+        fig_traj = go.Figure()
+        for i, lab in enumerate(regime_label_list):
+            fig_traj.add_trace(go.Scatter(
+                x=step_axis,
+                y=fc_result.posterior_trajectory[:, i] * 100,
+                mode="lines",
+                stackgroup="one",
+                name=lab,
+                line=dict(width=0.5, color=get_regime_color(lab)),
+                fillcolor=get_regime_color(lab),
+            ))
+        fig_traj.update_layout(
+            template="plotly_dark",
+            height=360,
+            xaxis_title="Bars ahead",
+            yaxis_title="P(regime) %",
+            yaxis=dict(range=[0, 100]),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_traj, use_container_width=True)
+
+        # ── Cumulative return cone ──
+        st.subheader("Cumulative Return Cone")
+        st.caption(
+            "Closed-form analytical cone: E[R] ± kσ where σ is derived "
+            "from the law of total variance across the regime mixture."
+        )
+        cone_x = list(range(1, fc_result.horizon + 1))
+        fig_cone = go.Figure()
+        fig_cone.add_trace(go.Scatter(
+            x=cone_x + cone_x[::-1],
+            y=list(fc_result.cone_upper_2 * 100) + list(fc_result.cone_lower_2 * 100)[::-1],
+            fill="toself", fillcolor="rgba(0, 229, 153, 0.08)",
+            line=dict(color="rgba(0,0,0,0)"), name="±2σ",
+        ))
+        fig_cone.add_trace(go.Scatter(
+            x=cone_x + cone_x[::-1],
+            y=list(fc_result.cone_upper_1 * 100) + list(fc_result.cone_lower_1 * 100)[::-1],
+            fill="toself", fillcolor="rgba(0, 229, 153, 0.18)",
+            line=dict(color="rgba(0,0,0,0)"), name="±1σ",
+        ))
+        fig_cone.add_trace(go.Scatter(
+            x=cone_x, y=fc_result.cumulative_mean * 100,
+            mode="lines", name="E[R]",
+            line=dict(color="#00e599", width=2.5),
+        ))
+        fig_cone.add_hline(y=0, line_dash="dot", line_color="#64748b")
+        fig_cone.update_layout(
+            template="plotly_dark", height=360,
+            xaxis_title="Bars ahead",
+            yaxis_title="Cumulative log return (%)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_cone, use_container_width=True)
+
+        # ── First passage & time-in-regime ──
+        st.subheader("Regime Timing")
+        col_fpt, col_tir = st.columns(2)
+
+        with col_fpt:
+            st.markdown("**Expected First Passage (bars to enter regime)**")
+            st.caption(
+                "Averaged over the current posterior via the fundamental "
+                "matrix of the absorbing chain. Answers 'how long until "
+                "the market enters state X?'"
+            )
+            avg_fpt = fc_engine.expected_first_passage_from_posterior(
+                current_posterior, fc_result.first_passage_time
+            )
+            fpt_df = pd.DataFrame({
+                "Regime": regime_label_list,
+                "E[T] (bars)": [
+                    f"{v:.1f}" if np.isfinite(v) else "∞"
+                    for v in avg_fpt
+                ],
+            })
+            st.dataframe(fpt_df, hide_index=True, use_container_width=True)
+
+            finite_mask = np.isfinite(avg_fpt)
+            if finite_mask.any():
+                fig_fpt = go.Figure(go.Bar(
+                    x=[regime_label_list[i] for i in range(len(avg_fpt)) if finite_mask[i]],
+                    y=[avg_fpt[i] for i in range(len(avg_fpt)) if finite_mask[i]],
+                    marker_color=[
+                        get_regime_color(regime_label_list[i])
+                        for i in range(len(avg_fpt)) if finite_mask[i]
+                    ],
+                ))
+                fig_fpt.update_layout(
+                    template="plotly_dark", height=260,
+                    yaxis_title="Bars until first entry",
+                    xaxis_title="",
+                )
+                st.plotly_chart(fig_fpt, use_container_width=True)
+
+        with col_tir:
+            st.markdown("**Expected Time In Regime (horizon total)**")
+            st.caption(
+                "Sum of posterior probabilities over the forecast window — "
+                "by linearity of expectation, the expected bars spent in each regime."
+            )
+            tir_df = pd.DataFrame({
+                "Regime": regime_label_list,
+                "E[bars]": fc_result.expected_time_in_regime.round(2),
+                "% of horizon": (
+                    fc_result.expected_time_in_regime / fc_result.horizon * 100
+                ).round(1),
+            })
+            st.dataframe(tir_df, hide_index=True, use_container_width=True)
+
+            fig_tir = go.Figure(go.Bar(
+                x=regime_label_list,
+                y=fc_result.expected_time_in_regime,
+                marker_color=[get_regime_color(r) for r in regime_label_list],
+            ))
+            fig_tir.update_layout(
+                template="plotly_dark", height=260,
+                yaxis_title="Expected bars in regime",
+                xaxis_title="",
+            )
+            st.plotly_chart(fig_tir, use_container_width=True)
+
+        # ── Most likely path ──
+        st.subheader("Most Likely Regime Path")
+        st.caption(
+            "Forward dynamic program over the transition matrix: the mode of the "
+            "joint distribution over future state sequences given the current belief."
+        )
+        path_labels = [labels.get(int(s), f"S{int(s)}") for s in fc_result.most_likely_path]
+        path_colors = [get_regime_color(lab) for lab in path_labels]
+
+        fig_path = go.Figure()
+        fig_path.add_trace(go.Bar(
+            x=list(range(1, fc_result.horizon + 1)),
+            y=[1] * fc_result.horizon,
+            marker_color=path_colors,
+            hovertext=path_labels,
+            hoverinfo="text+x",
+            showlegend=False,
+        ))
+        fig_path.update_layout(
+            template="plotly_dark",
+            height=110,
+            margin=dict(l=20, r=20, t=10, b=30),
+            xaxis_title="Bars ahead",
+            yaxis=dict(visible=False, range=[0, 1]),
+            bargap=0.05,
+        )
+        st.plotly_chart(fig_path, use_container_width=True)
+
+        # ── Expected utility action breakdown ──
+        st.subheader("Expected-Utility Action Analysis")
+        st.caption(
+            "For each candidate action, E[log W] ≈ a·E[R] − ½λ·a²·Var[R] "
+            "evaluated at the horizon moments. The best action is the argmax."
+        )
+        eu_rows = []
+        action_names = {-1: "SHORT", 0: "FLAT", 1: "LONG"}
+        for a, eu in fc_result.eu_values.items():
+            eu_rows.append({
+                "Action": action_names[a],
+                "E[U]": f"{eu:+.5f}",
+                "Recommended": "★" if a == fc_result.eu_best_action else "",
+            })
+        st.dataframe(pd.DataFrame(eu_rows), hide_index=True, use_container_width=True)
+
+        current_signal = int(df["signal"].iloc[-1])
+        if fc_result.eu_best_action != current_signal:
+            st.warning(
+                f"Forecast disagreement: current strategy signal is "
+                f"**{action_map.get(current_signal, 'FLAT')}** but the "
+                f"expected-utility optimizer prefers "
+                f"**{action_map[fc_result.eu_best_action]}**. "
+                "Treat as a caution flag — the forecast engine is unaware "
+                "of the confirmation stack, so disagreement often means "
+                "the regime view is leading the indicator view."
+            )
+        else:
+            st.success(
+                f"Forecast aligned: EU optimizer agrees with the current "
+                f"**{action_map.get(current_signal, 'FLAT')}** signal."
+            )
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────

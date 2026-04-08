@@ -69,6 +69,12 @@ monte_carlo:
   ruin_threshold: 0.5              # equity fraction defining ruin (50% loss)
   seed: 42                         # reproducibility
 
+forecast:
+  horizon: 30                      # bars ahead for analytical forecast
+  risk_aversion: 1.0               # mean-variance risk aversion for EU signal
+  max_size: 1.0                    # cap on EU-recommended position size
+  min_transition_prob: 1.0e-12     # log-space floor for numerical stability
+
 backtest:
   train_window_bars: 500
   test_window_bars: 100
