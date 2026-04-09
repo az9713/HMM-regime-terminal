@@ -20,9 +20,11 @@ This roadmap proposes practical, high-leverage upgrades to push the HMM Regime T
    - Move from static retrains to frequent incremental updates.
    - Reduces stale model risk during fast market transitions.
 
-5. **Probabilistic calibration layer**
+5. **Probabilistic calibration layer** *(partial — see Bayesian Forecast tab)*
    - Calibrate state probabilities (e.g., isotonic/Platt) against forward returns.
    - Makes confidence values more trustworthy for sizing and risk gating.
+   - Implemented: reliability diagram + CRPS / MAE / bias scoring in
+     `regime_forecast.RegimeForecaster.calibrate` and the Bayesian Forecast tab.
 
 ## 2) Feature Engineering & Data Breadth
 
@@ -73,6 +75,20 @@ This roadmap proposes practical, high-leverage upgrades to push the HMM Regime T
 16. **Regime-stratified performance attribution**
     - Break out PnL, Sharpe, hit-rate, and drawdown by regime and transition type.
     - Identifies where the system truly adds edge.
+
+### Bonus — Bayesian Regime Forecast Engine *(implemented)*
+
+A new module, `regime_forecast.py`, propagates the current HMM posterior
+through the transition matrix (π · T^k) to produce forward return distributions
+as Gaussian mixtures over per-regime emissions. It emits:
+
+- Closed-form marginal forecasts (exact mixture moments via the law of total
+  variance; quantiles via bisection)
+- Monte Carlo cumulative forecasts over multi-bar horizons
+- Forward regime probability trajectories for stacked-area visualization
+- Historical calibration validation (reliability diagrams, CRPS, MAE, bias)
+
+Exposed via the new "Bayesian Forecast" tab in the Streamlit dashboard.
 
 17. **Event-driven backtest engine mode**
     - Simulate order lifecycle (latency, partial fills, queue assumptions).

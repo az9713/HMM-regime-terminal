@@ -1,8 +1,9 @@
 """
-app.py — Streamlit dashboard with 6 tabs for HMM Regime Terminal.
+app.py — Streamlit dashboard for HMM Regime Terminal.
 
-Tabs: Current Signal, Regime Analysis, Backtest Results, Trade Log,
-      Model Diagnostics, Fundamentals.
+Tabs: Current Signal, Regime Analysis, Regime Transitions, Backtest Results,
+      Trade Log, Model Diagnostics, Fundamentals, Multi-Timeframe,
+      Monte Carlo, Bayesian Forecast.
 """
 
 import streamlit as st
@@ -21,6 +22,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from regime_forecast import RegimeForecaster
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +535,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Bayesian Forecast",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1722,343 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Bayesian Regime Forecast ───────────────────────────────
+
+    with tab10:
+        st.subheader("Bayesian Regime Forecast Engine")
+        st.caption(
+            "Propagates the current HMM posterior through the transition "
+            "matrix to emit forward return distributions with calibrated "
+            "confidence bands. Closed-form mixture moments for per-bar "
+            "forecasts; Monte Carlo over regime trajectories for cumulative "
+            "horizons; in-sample calibration validation via reliability "
+            "diagrams."
+        )
+
+        fc_cfg = config.get("forecast", {}) or {}
+        default_horizons = fc_cfg.get("horizons", [1, 3, 5, 10, 21])
+
+        fc_col1, fc_col2, fc_col3 = st.columns(3)
+        with fc_col1:
+            fc_max_h = st.number_input(
+                "Max Horizon (bars)",
+                min_value=5, max_value=252,
+                value=int(max(default_horizons)),
+                step=1,
+                key="fc_max_h",
+                help="Farthest forecast horizon to display.",
+            )
+        with fc_col2:
+            fc_n_paths = st.number_input(
+                "MC Paths",
+                min_value=500, max_value=20000,
+                value=int(fc_cfg.get("n_paths", 5000)),
+                step=500,
+                key="fc_n_paths",
+                help="Monte Carlo paths used for cumulative return forecasts.",
+            )
+        with fc_col3:
+            fc_seed = st.number_input(
+                "Seed",
+                min_value=0, max_value=99999,
+                value=int(fc_cfg.get("seed", 7)),
+                step=1,
+                key="fc_seed",
+                help="Random seed for reproducibility.",
+            )
+
+        fc_run = st.button(
+            "Generate Forecast", type="primary", key="fc_run"
+        )
+
+        if fc_run:
+            # Build the horizons grid as 1..max_h (dense for the fan chart)
+            all_horizons = list(range(1, int(fc_max_h) + 1))
+            # Report horizons: a subset of human-friendly milestones
+            report_h_all = [1, 3, 5, 10, 21, 42, 63, 126, 252]
+            report_horizons = [h for h in report_h_all if h <= int(fc_max_h)]
+            if int(fc_max_h) not in report_horizons:
+                report_horizons.append(int(fc_max_h))
+            report_horizons = sorted(set(report_horizons))
+
+            with st.spinner("Fitting per-regime return distributions..."):
+                # Raw log returns from df (NOT z-scored). The HMM was fit on
+                # standardized features, but the forecaster needs raw returns
+                # to produce forecasts in actual log-return space.
+                raw_returns = df["log_return"].values.astype(float)
+
+                forecaster_cfg = {
+                    "forecast": {
+                        "horizons": report_horizons,
+                        "n_paths": int(fc_n_paths),
+                        "seed": int(fc_seed),
+                        "calibration_horizons": fc_cfg.get(
+                            "calibration_horizons", [1, 5]
+                        ),
+                        "calibration_min_history": fc_cfg.get(
+                            "calibration_min_history", 200
+                        ),
+                    }
+                }
+                forecaster = RegimeForecaster(forecaster_cfg)
+                forecaster.fit(
+                    transmat=transmat,
+                    posteriors=posteriors,
+                    returns=raw_returns,
+                    labels=labels,
+                )
+
+            current_posterior = posteriors[-1]
+
+            with st.spinner("Computing forecasts..."):
+                # Dense per-step forecast for the fan chart
+                dense_marg = forecaster.forecast_marginal(
+                    current_posterior, horizons=all_horizons
+                )
+                dense_cum = forecaster.forecast_cumulative(
+                    current_posterior,
+                    horizons=all_horizons,
+                    n_paths=int(fc_n_paths),
+                    seed=int(fc_seed),
+                )
+                forecast_result = forecaster.forecast(
+                    current_posterior, horizons=report_horizons
+                )
+                trajectory = forecaster.posterior_trajectory(
+                    current_posterior, max_horizon=int(fc_max_h)
+                )
+
+            # ── Headline metrics ─────────────────────────────────────────
+            st.markdown("---")
+            st.subheader("Headline Horizon Forecasts")
+
+            headline_hs = [h for h in [1, 5, 21] if h in report_horizons]
+            cols = st.columns(max(len(headline_hs), 1))
+            for i, h in enumerate(headline_hs):
+                idx = report_horizons.index(h)
+                with cols[i]:
+                    st.metric(
+                        f"Cumulative @ {h} bars",
+                        f"{forecast_result.cumulative_mean_simple[idx]:+.2%}",
+                        help=(
+                            f"P(up) = {forecast_result.cumulative_p_up[idx]:.1%} • "
+                            f"68% CI: [{forecast_result.cumulative_q16[idx]:+.2%}, "
+                            f"{forecast_result.cumulative_q84[idx]:+.2%}]"
+                        ),
+                    )
+
+            # ── Cumulative return fan chart ──────────────────────────────
+            st.markdown("---")
+            st.subheader("Cumulative Return Fan Chart")
+            st.caption(
+                "Monte Carlo quantile bands for the cumulative simple return "
+                "starting from the current bar. Current regime uncertainty "
+                "propagates forward through the transition matrix."
+            )
+
+            x_axis = list(range(1, int(fc_max_h) + 1))
+            q05 = dense_cum["q05"] * 100
+            q16 = dense_cum["q16"] * 100
+            q50 = dense_cum["q50"] * 100
+            q84 = dense_cum["q84"] * 100
+            q95 = dense_cum["q95"] * 100
+            mean_line = dense_cum["mean_simple"] * 100
+
+            fig_fc = go.Figure()
+            # 5-95 band
+            fig_fc.add_trace(go.Scatter(
+                x=x_axis + x_axis[::-1],
+                y=list(q95) + list(q05)[::-1],
+                fill="toself", fillcolor="rgba(0, 229, 153, 0.08)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name="5-95% (95% CI)", hoverinfo="skip",
+            ))
+            # 16-84 band
+            fig_fc.add_trace(go.Scatter(
+                x=x_axis + x_axis[::-1],
+                y=list(q84) + list(q16)[::-1],
+                fill="toself", fillcolor="rgba(0, 229, 153, 0.22)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name="16-84% (68% CI)", hoverinfo="skip",
+            ))
+            # Median
+            fig_fc.add_trace(go.Scatter(
+                x=x_axis, y=list(q50),
+                mode="lines", name="Median",
+                line=dict(color="#00e599", width=2.5),
+            ))
+            # Expected value
+            fig_fc.add_trace(go.Scatter(
+                x=x_axis, y=list(mean_line),
+                mode="lines", name="Expected",
+                line=dict(color="#06b6d4", width=2, dash="dash"),
+            ))
+            fig_fc.add_hline(
+                y=0, line_dash="dot", line_color="#64748b",
+                annotation_text="Break-even",
+            )
+            fig_fc.update_layout(
+                template="plotly_dark",
+                height=460,
+                xaxis_title="Bars Ahead",
+                yaxis_title="Cumulative Return (%)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_fc, use_container_width=True)
+
+            # ── Forward regime probability evolution ─────────────────────
+            st.subheader("Forward Regime Probability Evolution")
+            st.caption(
+                "How the current posterior dissolves over time via π · T^k. "
+                "Shows the gradual convergence toward the stationary distribution."
+            )
+
+            traj_x = list(range(0, int(fc_max_h) + 1))
+            fig_traj = go.Figure()
+            state_labels_order = [
+                labels.get(i, f"S{i}") for i in range(detector.n_states)
+            ]
+            for s in range(detector.n_states):
+                fig_traj.add_trace(go.Scatter(
+                    x=traj_x,
+                    y=trajectory[:, s] * 100,
+                    mode="lines",
+                    name=state_labels_order[s],
+                    stackgroup="one",
+                    line=dict(width=0.5, color=get_regime_color(state_labels_order[s])),
+                    fillcolor=get_regime_color(state_labels_order[s]),
+                    groupnorm="percent",
+                ))
+            fig_traj.update_layout(
+                template="plotly_dark",
+                height=340,
+                xaxis_title="Bars Ahead",
+                yaxis_title="Regime Probability (%)",
+                yaxis=dict(range=[0, 100]),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_traj, use_container_width=True)
+
+            # ── Horizon summary table ────────────────────────────────────
+            st.subheader("Horizon Summary")
+
+            summary_rows = []
+            for i, h in enumerate(report_horizons):
+                summary_rows.append({
+                    "Horizon (bars)": int(h),
+                    "E[cum return]": f"{forecast_result.cumulative_mean_simple[i]:+.2%}",
+                    "P(up)": f"{forecast_result.cumulative_p_up[i]:.1%}",
+                    "5%": f"{forecast_result.cumulative_q05[i]:+.2%}",
+                    "16%": f"{forecast_result.cumulative_q16[i]:+.2%}",
+                    "Median": f"{forecast_result.cumulative_q50[i]:+.2%}",
+                    "84%": f"{forecast_result.cumulative_q84[i]:+.2%}",
+                    "95%": f"{forecast_result.cumulative_q95[i]:+.2%}",
+                    "E[bar return]": f"{forecast_result.marginal_mean[i]:+.4%}",
+                    "σ (bar)": f"{forecast_result.marginal_std[i]:.4%}",
+                })
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True,
+                         hide_index=True)
+
+            # ── Calibration diagnostics ──────────────────────────────────
+            st.markdown("---")
+            st.subheader("Calibration Validation")
+            st.caption(
+                "Rolling in-sample coverage check: at every historical bar "
+                "we emit a forecast from that bar's posterior and compare "
+                "to the realized cumulative return. Empirical coverage "
+                "near nominal means the probabilistic bands are trustworthy."
+            )
+
+            calib_horizons = [h for h in [1, 5] if h <= int(fc_max_h)]
+            with st.spinner("Running calibration..."):
+                try:
+                    calib_results = forecaster.calibrate(
+                        posteriors=posteriors,
+                        returns=raw_returns,
+                        horizons=calib_horizons,
+                        nominal_levels=[0.05, 0.16, 0.5, 0.84, 0.95],
+                        min_history=min(
+                            int(fc_cfg.get("calibration_min_history", 200)),
+                            max(len(raw_returns) - 30, 10),
+                        ),
+                        stride=max(1, len(raw_returns) // 400),
+                    )
+                except Exception as e:
+                    st.warning(f"Calibration skipped: {e}")
+                    calib_results = []
+
+            if calib_results:
+                calib_cols = st.columns(len(calib_results))
+                for i, cr in enumerate(calib_results):
+                    with calib_cols[i]:
+                        st.markdown(f"**Horizon: {cr.horizon} bar(s)**")
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("CRPS", f"{cr.crps:.4f}",
+                                  help="Lower is better. Gaussian CRPS.")
+                        m2.metric("MAE", f"{cr.mae:.4f}",
+                                  help="Mean absolute error of forecast mean.")
+                        m3.metric("Bias", f"{cr.mean_bias:+.4f}",
+                                  help="Mean(forecast − realized).")
+
+                        fig_rel = go.Figure()
+                        fig_rel.add_trace(go.Scatter(
+                            x=[0, 1], y=[0, 1],
+                            mode="lines",
+                            line=dict(color="#64748b", dash="dash", width=1),
+                            name="Perfect calibration", showlegend=False,
+                        ))
+                        fig_rel.add_trace(go.Scatter(
+                            x=list(cr.nominal_levels),
+                            y=list(cr.empirical_coverage),
+                            mode="lines+markers",
+                            line=dict(color="#00e599", width=2.5),
+                            marker=dict(size=10),
+                            name="Empirical", showlegend=False,
+                        ))
+                        fig_rel.update_layout(
+                            template="plotly_dark",
+                            height=280,
+                            xaxis_title="Nominal Quantile",
+                            yaxis_title="Empirical Coverage",
+                            xaxis=dict(range=[0, 1]),
+                            yaxis=dict(range=[0, 1]),
+                            title=f"Reliability Diagram (n={cr.n_observations})",
+                            margin=dict(l=10, r=10, t=40, b=10),
+                        )
+                        st.plotly_chart(fig_rel, use_container_width=True)
+            else:
+                st.info(
+                    "Not enough history for calibration. Try a longer "
+                    "lookback window in the sidebar."
+                )
+
+            # ── Per-regime parameters used by forecaster ─────────────────
+            with st.expander("Per-Regime Return Parameters (fitted)"):
+                params = forecaster.regime_params
+                rp_rows = []
+                for i in range(forecaster.n_states):
+                    rp_rows.append({
+                        "State": i,
+                        "Label": labels.get(i, f"S{i}"),
+                        "Mean log return": f"{params.means[i]:+.5f}",
+                        "Std log return": f"{params.stds[i]:.5f}",
+                        "Posterior weight": f"{params.weights[i]:.1f}",
+                        "Hard samples": len(params.samples[i]),
+                    })
+                st.dataframe(pd.DataFrame(rp_rows), use_container_width=True,
+                             hide_index=True)
+                st.caption(
+                    "Parameters fitted by posterior-weighted (soft) moment "
+                    "matching on the raw historical log-return series. These "
+                    "define the per-regime Gaussian emissions used by the "
+                    "forward-propagation math."
+                )
+        else:
+            st.info(
+                "Click **Generate Forecast** to propagate the current posterior "
+                "forward and emit return distributions with confidence bands."
+            )
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────

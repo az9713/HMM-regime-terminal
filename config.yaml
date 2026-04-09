@@ -69,6 +69,14 @@ monte_carlo:
   ruin_threshold: 0.5              # equity fraction defining ruin (50% loss)
   seed: 42                         # reproducibility
 
+forecast:
+  horizons: [1, 3, 5, 10, 21]      # bars ahead to forecast
+  n_paths: 5000                    # MC paths for cumulative forecast
+  seed: 7                          # reproducibility
+  calibration_horizons: [1, 5]     # horizons to validate reliability on
+  calibration_min_history: 200     # min bars before we start rolling forecasts
+  min_regime_std: 1.0e-6           # numerical floor on per-regime std
+
 backtest:
   train_window_bars: 500
   test_window_bars: 100
