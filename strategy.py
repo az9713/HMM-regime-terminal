@@ -105,6 +105,7 @@ class SignalGenerator:
         posteriors: np.ndarray,
         labels: dict[int, str],
         confidence: np.ndarray,
+        adaptive_hysteresis: np.ndarray | None = None,
     ) -> pd.Series:
         """
         Generate trading signals: 1 (long), -1 (short), 0 (flat).
@@ -113,8 +114,16 @@ class SignalGenerator:
           - Enter long: bullish regime + min confirmations met + confidence above threshold
           - Enter short: bearish regime + min confirmations met + confidence above threshold
           - Hysteresis: regime must persist for hysteresis_bars before acting
+            (reduced by BOCPD when transition urgency is high)
           - Cooldown: no new signal within cooldown_bars of last signal
           - Min hold: once in a position, hold for at least min_hold_bars
+
+        Parameters
+        ----------
+        adaptive_hysteresis : ndarray, optional
+            Per-bar hysteresis from BOCPD fusion. When provided, overrides
+            the fixed hysteresis_bars, allowing faster entries at detected
+            regime transitions.
         """
         n = len(df)
         signals = np.zeros(n, dtype=int)
@@ -148,8 +157,9 @@ class SignalGenerator:
                 signals[t] = 0
                 continue
 
-            # Check hysteresis
-            if regime_persist[t] < self.hysteresis_bars:
+            # Check hysteresis (adaptive if BOCPD provides it)
+            hyst = int(adaptive_hysteresis[t]) if adaptive_hysteresis is not None else self.hysteresis_bars
+            if regime_persist[t] < hyst:
                 signals[t] = current_pos  # maintain current position
                 continue
 

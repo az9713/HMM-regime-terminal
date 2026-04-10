@@ -21,6 +21,10 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from changepoint import (
+    BayesianChangepoint, ChangepointHMMFusion,
+    create_bocpd_from_config, create_fusion_from_config,
+)
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -440,6 +444,11 @@ with st.sidebar:
     step_bars = st.slider("Step size (bars)", 10, 200,
                           base_config["backtest"]["step_bars"], 10)
 
+    st.header("Changepoint Detection")
+    enable_bocpd = st.checkbox("Enable BOCPD", True, help="Bayesian Online Changepoint Detection for faster regime transition signals")
+    bocpd_hazard = st.slider("Hazard rate (bars)", 20, 500, base_config.get("changepoint", {}).get("hazard_rate", 100), 10,
+                             help="Expected bars between changepoints")
+
     st.header("Multi-Timeframe")
     enable_mtf = st.checkbox("Enable Multi-Timeframe Fusion", False)
     mtf_intervals_options = ["1m", "5m", "15m", "1h", "1d"]
@@ -468,6 +477,8 @@ def build_config():
                    "use_entropy_scaling": use_entropy, "max_leverage": max_leverage}
     cfg["backtest"] = {**base_config["backtest"], "train_window_bars": train_window,
                        "test_window_bars": test_window, "step_bars": step_bars}
+    cfg["changepoint"] = {**base_config.get("changepoint", {}),
+                          "enabled": enable_bocpd, "hazard_rate": bocpd_hazard}
     return cfg
 
 # ── Regime color map ─────────────────────────────────────────────────────────
@@ -520,10 +531,34 @@ if run_btn:
 
     st.success(f"Selected {detector.n_states} states (BIC)")
 
+    # ── Run BOCPD if enabled ──
+    fusion_result = None
+    if config.get("changepoint", {}).get("enabled", False):
+        with st.spinner("Running Bayesian Changepoint Detection..."):
+            bocpd = create_bocpd_from_config(config)
+            # Run on log returns (feature 0, the primary signal)
+            log_returns = X[:, 0]
+            bocpd_result = bocpd.detect(log_returns)
+
+            fusion = create_fusion_from_config(config)
+            fusion_result = fusion.fuse(
+                bocpd_result, entropy, confidence, posteriors,
+                n_states=detector.n_states,
+                base_hysteresis=config.get("strategy", {}).get("hysteresis_bars", 3),
+            )
+        st.success(
+            f"BOCPD: {len(bocpd_result.changepoint_indices)} changepoints detected "
+            f"(threshold={bocpd.threshold})"
+        )
+
     # ── Compute confirmations and signals ──
     sig_gen = SignalGenerator(config)
     df_conf = sig_gen.compute_confirmations(df)
-    signals = sig_gen.generate_signals(df_conf, states, posteriors, labels, confidence)
+    adaptive_hyst = fusion_result["adaptive_hysteresis"] if fusion_result else None
+    signals = sig_gen.generate_signals(
+        df_conf, states, posteriors, labels, confidence,
+        adaptive_hysteresis=adaptive_hyst,
+    )
 
     # Add regime labels to df
     df["regime"] = [labels.get(s, "unknown") for s in states]
@@ -533,10 +568,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Changepoint Detection",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1755,184 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Changepoint Detection ─────────────────────────────────────
+
+    with tab10:
+        if fusion_result is None:
+            st.info("Enable **BOCPD** in the sidebar to use Changepoint Detection.")
+        else:
+            st.subheader("Bayesian Online Changepoint Detection")
+
+            cp_prob = fusion_result["changepoint_prob"]
+            urgency = fusion_result["urgency"]
+            erl = fusion_result["expected_run_length"]
+            adapt_hyst = fusion_result["adaptive_hysteresis"]
+            rl_dist = fusion_result["run_length_dist"]
+            map_rl = fusion_result["map_run_length"]
+
+            # Use datetime index from df
+            x_axis = df["Datetime"].values if "Datetime" in df.columns else (
+                df["Date"].values if "Date" in df.columns else list(range(len(df)))
+            )
+
+            # ── Price + Changepoint Overlay ──
+            fig_cp = make_subplots(
+                rows=3, cols=1, shared_xaxes=True,
+                vertical_spacing=0.04,
+                row_heights=[0.4, 0.3, 0.3],
+                subplot_titles=("Price + Changepoint Detections", "Changepoint Probability & Transition Urgency", "Expected Run Length"),
+            )
+
+            # Price trace
+            fig_cp.add_trace(go.Scatter(
+                x=x_axis, y=df["Close"].values,
+                mode="lines", name="Price",
+                line=dict(color="#e2e8f0", width=1),
+            ), row=1, col=1)
+
+            # Changepoint markers on price
+            cp_mask = cp_prob > bocpd.threshold
+            if cp_mask.any():
+                fig_cp.add_trace(go.Scatter(
+                    x=x_axis[cp_mask], y=df["Close"].values[cp_mask],
+                    mode="markers", name="Changepoints",
+                    marker=dict(color="#ef4444", size=8, symbol="diamond",
+                                line=dict(width=1, color="#ffffff")),
+                ), row=1, col=1)
+
+            # Regime background shading on price
+            for regime_label, color in REGIME_COLORS.items():
+                mask = df["regime"].values == regime_label
+                if mask.any():
+                    fig_cp.add_trace(go.Scatter(
+                        x=x_axis[mask], y=df["Close"].values[mask],
+                        mode="markers", name=regime_label,
+                        marker=dict(color=color, size=3, opacity=0.4),
+                        showlegend=False,
+                    ), row=1, col=1)
+
+            # Changepoint probability
+            fig_cp.add_trace(go.Scatter(
+                x=x_axis, y=cp_prob,
+                mode="lines", name="CP Probability",
+                line=dict(color="#ef4444", width=1.5),
+                fill="tozeroy", fillcolor="rgba(239, 68, 68, 0.15)",
+            ), row=2, col=1)
+
+            # Transition urgency overlay
+            fig_cp.add_trace(go.Scatter(
+                x=x_axis, y=urgency,
+                mode="lines", name="Transition Urgency",
+                line=dict(color="#f59e0b", width=1.5),
+            ), row=2, col=1)
+
+            # Threshold line
+            fig_cp.add_hline(y=bocpd.threshold, row=2, col=1,
+                             line_dash="dot", line_color="#64748b",
+                             annotation_text=f"threshold={bocpd.threshold}")
+
+            # Expected run length
+            fig_cp.add_trace(go.Scatter(
+                x=x_axis, y=erl,
+                mode="lines", name="Expected Run Length",
+                line=dict(color="#06b6d4", width=1.5),
+                fill="tozeroy", fillcolor="rgba(6, 182, 212, 0.1)",
+            ), row=3, col=1)
+
+            # MAP run length
+            fig_cp.add_trace(go.Scatter(
+                x=x_axis, y=map_rl,
+                mode="lines", name="MAP Run Length",
+                line=dict(color="#3b82f6", width=1, dash="dot"),
+            ), row=3, col=1)
+
+            fig_cp.update_layout(
+                template="plotly_dark", height=750,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                margin=dict(l=60, r=30, t=60, b=30),
+            )
+            fig_cp.update_yaxes(title_text="Price", row=1, col=1)
+            fig_cp.update_yaxes(title_text="Probability", row=2, col=1)
+            fig_cp.update_yaxes(title_text="Bars", row=3, col=1)
+            st.plotly_chart(fig_cp, use_container_width=True)
+
+            # ── Run-Length Heatmap ──
+            st.subheader("Run-Length Distribution Heatmap")
+            st.caption(
+                "Shows P(run length = r | data) over time. "
+                "Bright horizontal bands = stable regimes. "
+                "Mass snapping to r=0 = changepoint."
+            )
+
+            # Trim to display only the interesting part of the RL distribution
+            max_display_rl = min(int(erl.max() * 2) + 10, rl_dist.shape[1], 150)
+            rl_display = rl_dist[:, :max_display_rl].T
+
+            fig_rl = go.Figure(data=go.Heatmap(
+                z=rl_display,
+                x=x_axis,
+                y=list(range(max_display_rl)),
+                colorscale="Inferno",
+                zmin=0,
+                zmax=np.percentile(rl_display[rl_display > 0], 95) if (rl_display > 0).any() else 0.1,
+                colorbar=dict(title="P(r)"),
+            ))
+            fig_rl.update_layout(
+                template="plotly_dark", height=350,
+                xaxis_title="Time",
+                yaxis_title="Run Length (bars)",
+                margin=dict(l=60, r=30, t=30, b=30),
+            )
+            st.plotly_chart(fig_rl, use_container_width=True)
+
+            # ── Adaptive Hysteresis ──
+            st.subheader("Adaptive Hysteresis")
+            base_hyst = config.get("strategy", {}).get("hysteresis_bars", 3)
+
+            col_ah1, col_ah2, col_ah3 = st.columns(3)
+            with col_ah1:
+                st.metric("Base Hysteresis", f"{base_hyst} bars")
+            with col_ah2:
+                st.metric("Avg Adaptive Hysteresis", f"{adapt_hyst.mean():.1f} bars")
+            with col_ah3:
+                pct_reduced = (adapt_hyst < base_hyst).mean() * 100
+                st.metric("Time at Reduced Hysteresis", f"{pct_reduced:.1f}%")
+
+            fig_ah = go.Figure()
+            fig_ah.add_trace(go.Scatter(
+                x=x_axis, y=adapt_hyst,
+                mode="lines", name="Adaptive Hysteresis",
+                line=dict(color="#00e599", width=1.5),
+                fill="tozeroy", fillcolor="rgba(0, 229, 153, 0.1)",
+            ))
+            fig_ah.add_hline(y=base_hyst, line_dash="dash", line_color="#64748b",
+                             annotation_text=f"base={base_hyst}")
+            fig_ah.update_layout(
+                template="plotly_dark", height=250,
+                xaxis_title="Time",
+                yaxis_title="Hysteresis (bars)",
+                margin=dict(l=60, r=30, t=30, b=30),
+            )
+            st.plotly_chart(fig_ah, use_container_width=True)
+
+            # ── Transition Alerts Table ──
+            alerts = fusion_result["transition_alerts"]
+            if len(alerts) > 0:
+                st.subheader(f"Transition Alerts ({len(alerts)} detected)")
+                alert_rows = []
+                for idx in alerts[-20:]:  # show last 20
+                    alert_rows.append({
+                        "Bar": int(idx),
+                        "Time": str(x_axis[idx]) if hasattr(x_axis[idx], '__str__') else idx,
+                        "Regime": df["regime"].values[idx] if idx < len(df) else "?",
+                        "CP Prob": f"{cp_prob[idx]:.3f}",
+                        "Urgency": f"{urgency[idx]:.3f}",
+                        "Hysteresis": f"{adapt_hyst[idx]:.0f}",
+                    })
+                st.dataframe(pd.DataFrame(alert_rows), use_container_width=True)
+            else:
+                st.info("No transition alerts above urgency threshold.")
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────

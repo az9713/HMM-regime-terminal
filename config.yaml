@@ -69,6 +69,22 @@ monte_carlo:
   ruin_threshold: 0.5              # equity fraction defining ruin (50% loss)
   seed: 42                         # reproducibility
 
+changepoint:
+  enabled: true
+  hazard_rate: 100             # expected bars between changepoints
+  mu0: 0.0                     # prior mean
+  kappa0: 1.0                  # prior precision weight
+  alpha0: 1.0                  # inverse-gamma shape
+  beta0: 1.0                   # inverse-gamma scale
+  max_run_length: 300          # truncate run-length distribution
+  threshold: 0.3               # changepoint detection threshold
+  fusion:
+    cp_weight: 0.5             # weight for changepoint signal in urgency
+    entropy_weight: 0.3        # weight for entropy signal in urgency
+    posterior_shift_weight: 0.2 # weight for posterior shift in urgency
+    urgency_threshold: 0.4     # alert when urgency exceeds this
+    entropy_gradient_window: 5  # bars for entropy gradient
+
 backtest:
   train_window_bars: 500
   test_window_bars: 100
