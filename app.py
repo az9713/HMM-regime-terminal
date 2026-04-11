@@ -21,6 +21,11 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from regime_forecast import (
+    horizon_forecast,
+    regime_fragility_index,
+    fragility_adjusted_position,
+)
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +538,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Forecast & Fragility",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1725,256 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Forecast & Fragility ────────────────────────────────────
+
+    with tab10:
+        st.subheader("Regime Forecast & Fragility")
+        st.caption(
+            "Analytical forward projection of the Markov chain from the "
+            "current posterior. Complements the Monte Carlo tab with a "
+            "closed-form expected-value and a novel Regime Fragility Index "
+            "that quantifies how close the system is to a regime flip."
+        )
+
+        fc_col1, fc_col2, fc_col3 = st.columns(3)
+        with fc_col1:
+            fc_horizon = st.slider(
+                "Forecast horizon (bars)", 5, 200, 60, step=5, key="fc_horizon",
+            )
+        with fc_col2:
+            fc_annualize = st.number_input(
+                "Sharpe annualization (√bars/yr)",
+                1.0, 365.0, 1.0, step=1.0, key="fc_annualize",
+                help="Scales forecast Sharpe. Use √252 for daily, √8760 for hourly.",
+            )
+        with fc_col3:
+            fragility_horizon = st.slider(
+                "Fragility horizon (bars)", 1, 50, 10, step=1, key="fc_frag_h",
+            )
+
+        # Build inputs from the fitted detector.
+        stats_sorted = regime_stats.sort_values("state")
+        fc_regime_means = stats_sorted["mean_return"].to_numpy(dtype=float)
+        fc_regime_vars = stats_sorted["volatility"].to_numpy(dtype=float) ** 2
+        last_post = posteriors[-1]
+
+        fc_result = horizon_forecast(
+            transmat=transmat,
+            initial_belief=last_post,
+            regime_means=fc_regime_means,
+            regime_vars=fc_regime_vars,
+            labels=labels,
+            horizon=int(fc_horizon),
+            annualization=float(fc_annualize),
+        )
+        frag = regime_fragility_index(
+            posteriors=posteriors,
+            transmat=transmat,
+            entropy_series=entropy,
+            horizon=int(fragility_horizon),
+        )
+
+        # ── Fragility gauge + components ──
+        st.markdown("---")
+        st.subheader("Regime Fragility Index")
+
+        gauge_col, comp_col = st.columns([1, 2])
+        with gauge_col:
+            gauge_color = (
+                "#22c55e" if frag.index < 0.35
+                else "#f59e0b" if frag.index < 0.65
+                else "#ef4444"
+            )
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=frag.index * 100,
+                number={"suffix": "%"},
+                title={"text": "Fragility"},
+                gauge={
+                    "axis": {"range": [0, 100]},
+                    "bar": {"color": gauge_color},
+                    "steps": [
+                        {"range": [0, 35], "color": "#14532d"},
+                        {"range": [35, 65], "color": "#713f12"},
+                        {"range": [65, 100], "color": "#7f1d1d"},
+                    ],
+                },
+            ))
+            fig_gauge.update_layout(
+                template="plotly_dark", height=260,
+                margin=dict(l=20, r=20, t=40, b=20),
+            )
+            st.plotly_chart(fig_gauge, use_container_width=True)
+
+        with comp_col:
+            comp = frag.components
+            comp_df = pd.DataFrame([
+                {"Component": "Posterior Closeness",
+                 "Score": comp["posterior_closeness"]},
+                {"Component": "Entropy Gradient",
+                 "Score": comp["entropy_gradient"]},
+                {"Component": "Stationary Convergence",
+                 "Score": comp["stationary_convergence"]},
+                {"Component": f"P(change in {fragility_horizon}b)",
+                 "Score": comp["horizon_change_probability"]},
+            ])
+            fig_comp = go.Figure(go.Bar(
+                x=comp_df["Score"],
+                y=comp_df["Component"],
+                orientation="h",
+                marker_color="#f59e0b",
+            ))
+            fig_comp.update_layout(
+                template="plotly_dark", height=260,
+                xaxis=dict(range=[0, 1], title="Fragility contribution"),
+                margin=dict(l=20, r=20, t=20, b=20),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_comp, use_container_width=True)
+            st.caption(
+                f"Posterior gap = {frag.posterior_gap:.3f}  \u2022  "
+                f"Entropy \u0394 = {frag.entropy_gradient:+.3f}  \u2022  "
+                f"KL(belief \u2016 \u03c0) = {frag.kl_from_stationary:.3f}  \u2022  "
+                f"P(flip in {fragility_horizon} bars) = {frag.change_probability:.1%}"
+            )
+
+        # ── Projected regime probabilities ──
+        st.markdown("---")
+        st.subheader("Projected Regime Probabilities")
+
+        fc_df = fc_result.to_dataframe()
+        x_steps = list(range(fc_result.horizon + 1))
+        fig_dist = go.Figure()
+        for idx, lbl in enumerate(fc_result.regime_labels):
+            rgb = get_regime_color(lbl)
+            fig_dist.add_trace(go.Scatter(
+                x=x_steps,
+                y=fc_result.distribution[:, idx],
+                mode="lines",
+                name=lbl,
+                stackgroup="one",
+                line=dict(width=0.5, color=rgb),
+                fillcolor=rgb,
+            ))
+        fig_dist.update_layout(
+            template="plotly_dark", height=340,
+            xaxis_title="Bars ahead",
+            yaxis_title="P(state)",
+            yaxis=dict(range=[0, 1]),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+        # ── Cumulative expected return with ±1σ band ──
+        st.subheader("Forecast Cumulative Return & Sharpe")
+
+        cum_std = np.sqrt(np.maximum(fc_result.cum_variance, 0.0))
+        upper = fc_result.cum_expected_return + cum_std
+        lower = fc_result.cum_expected_return - cum_std
+
+        fig_er = go.Figure()
+        fig_er.add_trace(go.Scatter(
+            x=x_steps + x_steps[::-1],
+            y=list(upper) + list(lower)[::-1],
+            fill="toself",
+            fillcolor="rgba(0, 229, 153, 0.15)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="\u00b11\u03c3 band",
+        ))
+        fig_er.add_trace(go.Scatter(
+            x=x_steps, y=fc_result.cum_expected_return,
+            mode="lines", name="E[\u03a3 log-return]",
+            line=dict(color="#00e599", width=2.5),
+        ))
+        fig_er.add_hline(y=0, line_dash="dot", line_color="#64748b")
+        fig_er.update_layout(
+            template="plotly_dark", height=320,
+            xaxis_title="Bars ahead",
+            yaxis_title="Cumulative log-return",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_er, use_container_width=True)
+
+        fig_sh = go.Figure()
+        fig_sh.add_trace(go.Scatter(
+            x=x_steps, y=fc_result.cum_sharpe,
+            mode="lines", name="Forecast Sharpe",
+            line=dict(color="#60a5fa", width=2.5),
+        ))
+        fig_sh.add_vline(
+            x=fc_result.optimal_horizon, line_dash="dash",
+            line_color="#f59e0b",
+            annotation_text=f"h* = {fc_result.optimal_horizon}",
+        )
+        fig_sh.update_layout(
+            template="plotly_dark", height=260,
+            xaxis_title="Bars ahead",
+            yaxis_title="Cumulative Sharpe",
+        )
+        st.plotly_chart(fig_sh, use_container_width=True)
+
+        # ── Regime change probability over horizon ──
+        st.subheader("Regime Change Probability Over Horizon")
+
+        fig_rc = go.Figure()
+        fig_rc.add_trace(go.Scatter(
+            x=x_steps,
+            y=fc_result.regime_change_prob * 100,
+            mode="lines",
+            line=dict(color="#ef4444", width=2.5),
+            fill="tozeroy",
+            fillcolor="rgba(239, 68, 68, 0.15)",
+            name="P(regime flipped by step h)",
+        ))
+        fig_rc.update_layout(
+            template="plotly_dark", height=260,
+            xaxis_title="Bars ahead",
+            yaxis_title="P(flipped) %",
+            yaxis=dict(range=[0, 100]),
+        )
+        st.plotly_chart(fig_rc, use_container_width=True)
+
+        # ── Actionable summary ──
+        st.markdown("---")
+        st.subheader("Actionable Summary")
+
+        base_size_suggested = sig_gen.compute_position_size(float(confidence[-1]))
+        adjusted_size = fragility_adjusted_position(
+            base_size=base_size_suggested,
+            fragility=frag.index,
+            expected_sharpe=fc_result.optimal_sharpe,
+        )
+
+        sm1, sm2, sm3, sm4 = st.columns(4)
+        with sm1:
+            st.metric(
+                "Optimal Horizon",
+                f"{fc_result.optimal_horizon} bars",
+                help="Bars ahead at which forecast Sharpe peaks.",
+            )
+        with sm2:
+            st.metric(
+                "Forecast Sharpe @ h*",
+                f"{fc_result.optimal_sharpe:.2f}",
+            )
+        with sm3:
+            st.metric(
+                "E[cum. return] @ h*",
+                f"{fc_result.cum_expected_return[fc_result.optimal_horizon]:+.2%}",
+            )
+        with sm4:
+            st.metric(
+                "Fragility-Adjusted Size",
+                f"{adjusted_size:.1%}",
+                delta=f"{adjusted_size - base_size_suggested:+.1%} vs base",
+            )
+
+        with st.expander("Forecast trajectory (raw)"):
+            st.dataframe(
+                fc_df.round(5),
+                use_container_width=True, hide_index=True,
+            )
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────
