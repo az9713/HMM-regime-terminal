@@ -63,6 +63,16 @@ multi_timeframe:
     1d: 1.0
     1wk: 1.2
 
+changepoint:
+  hazard_rate: 0.01                # P(changepoint) per bar; 1/100 = one per ~100 bars
+  max_run_length: 500              # truncate run-length distribution for performance
+  detection_threshold: 0.3         # min P(young segment) to flag as detected
+  cp_window: 10                    # P(run_length < cp_window) = changepoint score
+  mu0: 0.0                         # NIG prior mean (0 = symmetric around no return)
+  kappa0: 0.1                      # NIG prior precision (low = let data speak fast)
+  alpha0: 1.0                      # NIG prior shape
+  beta0: 0.001                     # NIG prior rate (matches hourly return variance)
+
 monte_carlo:
   n_paths: 1000                    # simulated market paths
   n_steps: 252                     # bars per path (252 ≈ 1 trading year daily)

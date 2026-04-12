@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from changepoint import BayesianChangepointDetector
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -450,6 +451,20 @@ with st.sidebar:
         help="Select 2+ timeframes. Base (fastest) is used as primary timeline.",
     )
 
+    st.header("Changepoint Detection")
+    cp_hazard = st.slider(
+        "Hazard rate", 0.001, 0.10,
+        float(base_config.get("changepoint", {}).get("hazard_rate", 0.01)),
+        0.001, format="%.3f",
+        help="Prior P(changepoint) per bar. Lower = fewer, more confident detections.",
+    )
+    cp_threshold = st.slider(
+        "Detection threshold", 0.05, 0.90,
+        float(base_config.get("changepoint", {}).get("detection_threshold", 0.3)),
+        0.05,
+        help="Minimum P(changepoint) to flag a structural break.",
+    )
+
     run_btn = st.button("Run Analysis", type="primary", use_container_width=True)
 
 # ── Build runtime config ─────────────────────────────────────────────────────
@@ -468,6 +483,9 @@ def build_config():
                    "use_entropy_scaling": use_entropy, "max_leverage": max_leverage}
     cfg["backtest"] = {**base_config["backtest"], "train_window_bars": train_window,
                        "test_window_bars": test_window, "step_bars": step_bars}
+    cp_base = base_config.get("changepoint", {})
+    cfg["changepoint"] = {**cp_base, "hazard_rate": cp_hazard,
+                          "detection_threshold": cp_threshold}
     return cfg
 
 # ── Regime color map ─────────────────────────────────────────────────────────
@@ -533,10 +551,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Changepoint Detection",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1738,305 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Changepoint Detection ───────────────────────────────────
+
+    with tab10:
+        st.subheader("Bayesian Online Changepoint Detection")
+        st.caption(
+            "Adams & MacKay (2007) — an independent, online algorithm that "
+            "detects structural breaks in the return series without batch "
+            "refitting. Complements HMM regime detection by identifying "
+            "transitions as they happen, often several bars earlier."
+        )
+
+        with st.spinner("Running BOCD on log returns..."):
+            cp_cfg = config.get("changepoint", {})
+            bocd = BayesianChangepointDetector(
+                hazard_rate=cp_cfg.get("hazard_rate", 0.01),
+                mu0=cp_cfg.get("mu0", 0.0),
+                kappa0=cp_cfg.get("kappa0", 0.1),
+                alpha0=cp_cfg.get("alpha0", 1.0),
+                beta0=cp_cfg.get("beta0", 0.001),
+                max_run_length=cp_cfg.get("max_run_length", 500),
+                detection_threshold=cp_cfg.get("detection_threshold", 0.3),
+                cp_window=cp_cfg.get("cp_window", 10),
+            )
+
+            log_returns = df["log_return"].values
+            cp_result = bocd.run(log_returns)
+
+            # HMM transitions for comparison
+            hmm_transitions = [
+                t for t in range(1, len(states))
+                if states[t] != states[t - 1]
+            ]
+            cp_result = bocd.compare_with_hmm_transitions(
+                cp_result, hmm_transitions
+            )
+
+            # Combined instability score
+            grad_window = 5
+            ent_gradient = np.zeros(len(entropy))
+            ent_gradient[grad_window:] = (
+                entropy[grad_window:] - entropy[:-grad_window]
+            )
+            instability = bocd.combined_instability_score(
+                cp_result.changepoint_prob, ent_gradient
+            )
+
+        # ── Summary metrics ──
+        cp_c1, cp_c2, cp_c3, cp_c4 = st.columns(4)
+        with cp_c1:
+            st.metric(
+                "Changepoints Detected",
+                len(cp_result.detected_changepoints),
+            )
+        with cp_c2:
+            st.metric("HMM Transitions", len(hmm_transitions))
+        with cp_c3:
+            if cp_result.early_detection_bars:
+                avg_early = cp_result.avg_early_detection
+                st.metric(
+                    "Avg Early Detection",
+                    f"{avg_early:.1f} bars",
+                    help="How many bars earlier BOCD detects vs HMM Viterbi",
+                )
+            else:
+                st.metric("Avg Early Detection", "N/A")
+        with cp_c4:
+            matched = len(cp_result.early_detection_bars)
+            total_hmm = max(len(hmm_transitions), 1)
+            st.metric(
+                "Transitions Matched",
+                f"{matched}/{len(hmm_transitions)}",
+                help="HMM transitions where BOCD detected earlier",
+            )
+
+        # ── Price + Changepoint Probability Overlay ──
+        st.subheader("Price with Changepoint Probability")
+        fig_cp_price = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            row_heights=[0.6, 0.4],
+            subplot_titles=["Price (regime-colored)", "P(Changepoint)"],
+            vertical_spacing=0.06,
+        )
+
+        # Price trace
+        fig_cp_price.add_trace(go.Scatter(
+            x=x_vals, y=df["Close"], mode="lines",
+            line=dict(color="#e2e8f0", width=1.2), name="Price",
+        ), row=1, col=1)
+
+        # Mark BOCD changepoints on price
+        if cp_result.detected_changepoints:
+            cp_bars = cp_result.detected_changepoints
+            cp_x = [x_vals.iloc[b] if hasattr(x_vals, "iloc") else x_vals[b]
+                     for b in cp_bars if b < len(x_vals)]
+            cp_y = [df["Close"].iloc[b] for b in cp_bars if b < len(df)]
+            fig_cp_price.add_trace(go.Scatter(
+                x=cp_x, y=cp_y, mode="markers",
+                marker=dict(color="#00e599", size=10, symbol="triangle-down",
+                            line=dict(color="white", width=1)),
+                name="BOCD Changepoint",
+            ), row=1, col=1)
+
+        # Mark HMM transitions on price
+        if hmm_transitions:
+            hmm_x = [x_vals.iloc[b] if hasattr(x_vals, "iloc") else x_vals[b]
+                      for b in hmm_transitions if b < len(x_vals)]
+            hmm_y = [df["Close"].iloc[b] for b in hmm_transitions if b < len(df)]
+            fig_cp_price.add_trace(go.Scatter(
+                x=hmm_x, y=hmm_y, mode="markers",
+                marker=dict(color="#f59e0b", size=8, symbol="diamond",
+                            line=dict(color="white", width=1)),
+                name="HMM Transition",
+            ), row=1, col=1)
+
+        # Changepoint probability
+        fig_cp_price.add_trace(go.Scatter(
+            x=x_vals, y=cp_result.changepoint_prob,
+            mode="lines", name="P(Changepoint)",
+            line=dict(color="#00e599", width=1.5),
+            fill="tozeroy", fillcolor="rgba(0, 229, 153, 0.15)",
+        ), row=2, col=1)
+
+        # Threshold line
+        fig_cp_price.add_hline(
+            y=cp_cfg.get("detection_threshold", 0.3),
+            line_dash="dash", line_color="#f59e0b",
+            annotation_text="Threshold", row=2, col=1,
+        )
+
+        fig_cp_price.update_layout(
+            height=600, template="plotly_dark",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        fig_cp_price.update_yaxes(title_text="Price", row=1, col=1)
+        fig_cp_price.update_yaxes(title_text="P(CP)", range=[0, 1], row=2, col=1)
+        st.plotly_chart(fig_cp_price, use_container_width=True)
+
+        # ── Run-Length Distribution Heatmap ──
+        st.subheader("Run-Length Distribution")
+        st.caption(
+            "The signature BOCD visualization. Diagonal lines show the "
+            "run length growing (current regime persisting). Vertical drops "
+            "to r=0 indicate detected changepoints (new regime starting)."
+        )
+
+        # Truncate y-axis for visualization (show first 150 run lengths)
+        display_max_rl = min(150, cp_result.run_length_dist.shape[1])
+        rl_matrix = cp_result.run_length_dist[:, :display_max_rl].T
+
+        fig_rl = go.Figure(data=go.Heatmap(
+            z=rl_matrix,
+            x=x_vals,
+            y=list(range(display_max_rl)),
+            colorscale="Viridis",
+            colorbar=dict(title="P(r)"),
+            hoverongaps=False,
+        ))
+        fig_rl.update_layout(
+            height=450, template="plotly_dark",
+            xaxis_title="Time",
+            yaxis_title="Run Length (bars since last changepoint)",
+        )
+        st.plotly_chart(fig_rl, use_container_width=True)
+
+        # ── BOCD vs HMM Timing Comparison ──
+        st.subheader("BOCD vs HMM Transition Timing")
+
+        if hmm_transitions and cp_result.detected_changepoints:
+            fig_timing = go.Figure()
+
+            # Timeline: HMM transitions as amber diamonds
+            fig_timing.add_trace(go.Scatter(
+                x=[x_vals.iloc[b] if hasattr(x_vals, "iloc") else x_vals[b]
+                   for b in hmm_transitions if b < len(x_vals)],
+                y=[1] * min(len(hmm_transitions), len(x_vals)),
+                mode="markers",
+                marker=dict(color="#f59e0b", size=12, symbol="diamond"),
+                name="HMM Transition",
+            ))
+
+            # Timeline: BOCD changepoints as green triangles
+            fig_timing.add_trace(go.Scatter(
+                x=[x_vals.iloc[b] if hasattr(x_vals, "iloc") else x_vals[b]
+                   for b in cp_result.detected_changepoints if b < len(x_vals)],
+                y=[0] * min(len(cp_result.detected_changepoints), len(x_vals)),
+                mode="markers",
+                marker=dict(color="#00e599", size=12, symbol="triangle-up"),
+                name="BOCD Changepoint",
+            ))
+
+            fig_timing.update_layout(
+                height=200, template="plotly_dark",
+                yaxis=dict(
+                    tickvals=[0, 1],
+                    ticktext=["BOCD", "HMM"],
+                    range=[-0.5, 1.5],
+                ),
+                xaxis_title="Time",
+                title="Structural Break Timeline: BOCD (bottom) vs HMM (top)",
+            )
+            st.plotly_chart(fig_timing, use_container_width=True)
+
+            # Early detection stats table
+            if cp_result.early_detection_bars:
+                st.markdown("**Early Detection Advantage**")
+                st.markdown(
+                    f"BOCD detected regime changes an average of "
+                    f"**{cp_result.avg_early_detection:.1f} bars** before the "
+                    f"HMM Viterbi path shifted, across "
+                    f"**{len(cp_result.early_detection_bars)}** matched transitions."
+                )
+                ed_df = pd.DataFrame({
+                    "Early Detection (bars)": cp_result.early_detection_bars,
+                })
+                ed_c1, ed_c2, ed_c3 = st.columns(3)
+                with ed_c1:
+                    st.metric("Min Lead", f"{min(cp_result.early_detection_bars)} bars")
+                with ed_c2:
+                    st.metric("Median Lead", f"{np.median(cp_result.early_detection_bars):.0f} bars")
+                with ed_c3:
+                    st.metric("Max Lead", f"{max(cp_result.early_detection_bars)} bars")
+        else:
+            st.info("Not enough transitions for timing comparison.")
+
+        # ── Combined Instability Score ──
+        st.subheader("Combined Regime Instability")
+        st.caption(
+            "Blends BOCD changepoint probability (60%) with HMM entropy "
+            "gradient (40%). High values indicate strong agreement between "
+            "two independent algorithms that a regime change is occurring."
+        )
+
+        fig_instab = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            row_heights=[0.5, 0.5],
+            subplot_titles=[
+                "Combined Instability Score",
+                "Component Signals: BOCD (green) vs Entropy Gradient (amber)",
+            ],
+            vertical_spacing=0.08,
+        )
+
+        fig_instab.add_trace(go.Scatter(
+            x=x_vals[:len(instability)], y=instability,
+            mode="lines", name="Instability",
+            line=dict(color="#ef4444", width=2),
+            fill="tozeroy", fillcolor="rgba(239, 68, 68, 0.12)",
+        ), row=1, col=1)
+        fig_instab.add_hline(
+            y=0.5, line_dash="dash", line_color="#64748b",
+            annotation_text="High instability", row=1, col=1,
+        )
+
+        # Component signals
+        fig_instab.add_trace(go.Scatter(
+            x=x_vals, y=cp_result.changepoint_prob,
+            mode="lines", name="BOCD P(cp)",
+            line=dict(color="#00e599", width=1.2),
+        ), row=2, col=1)
+
+        eg_norm = ent_gradient.copy()
+        eg_norm = np.clip(eg_norm, 0, None)
+        eg_max = eg_norm.max()
+        if eg_max > 0:
+            eg_norm = eg_norm / eg_max
+        fig_instab.add_trace(go.Scatter(
+            x=x_vals[:len(eg_norm)], y=eg_norm,
+            mode="lines", name="Entropy Gradient (norm)",
+            line=dict(color="#f59e0b", width=1.2),
+        ), row=2, col=1)
+
+        fig_instab.update_layout(
+            height=500, template="plotly_dark",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        fig_instab.update_yaxes(title_text="Score", range=[0, 1.05], row=1, col=1)
+        fig_instab.update_yaxes(title_text="Signal", range=[0, 1.05], row=2, col=1)
+        st.plotly_chart(fig_instab, use_container_width=True)
+
+        # ── MAP Run Length ──
+        st.subheader("MAP Run Length")
+        st.caption(
+            "The most probable run length at each bar. Upward slopes = "
+            "regime persisting. Drops to 0 = new regime detected."
+        )
+        fig_map = go.Figure()
+        fig_map.add_trace(go.Scatter(
+            x=x_vals, y=cp_result.max_run_length,
+            mode="lines", name="MAP Run Length",
+            line=dict(color="#3b82f6", width=1.5),
+            fill="tozeroy", fillcolor="rgba(59, 130, 246, 0.1)",
+        ))
+        fig_map.update_layout(
+            height=300, template="plotly_dark",
+            xaxis_title="Time",
+            yaxis_title="Run Length (bars)",
+        )
+        st.plotly_chart(fig_map, use_container_width=True)
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────
